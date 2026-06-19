@@ -1,0 +1,4 @@
+build/
+*.o
+*.seg
+/tmp/blobstore_*
