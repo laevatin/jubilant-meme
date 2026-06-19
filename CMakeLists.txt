@@ -19,7 +19,7 @@ add_executable(bench bench/bench.cpp)
 target_link_libraries(bench PRIVATE blobstore)
 
 enable_testing()
-foreach(t test_crc32c test_cache test_store test_recovery)
+foreach(t test_crc32c test_cache test_store test_recovery test_fuzz)
   add_executable(${t} test/${t}.cpp)
   target_include_directories(${t} PRIVATE include test)
   target_link_libraries(${t} PRIVATE blobstore)
