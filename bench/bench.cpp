@@ -75,7 +75,8 @@ static void bench_one_size(const Config& cfg, size_t block) {
     // Keep op counts reasonable: cap totals so 4K doesn't explode.
     uint64_t ops = (uint64_t)(cfg.target_bytes_per_size / block);
     ops = std::max<uint64_t>(ops, 64);
-    if (block >= (1u << 20)) ops = std::min<uint64_t>(ops, 2000);
+    // Single segment caps a store at <4 GiB; keep seq+conc+batch writes under it.
+    if (block >= (1u << 20)) ops = std::min<uint64_t>(ops, 1200);
     else ops = std::min<uint64_t>(ops, 200000);
 
     std::string dir = cfg.dir + "/sz" + std::to_string(block);
@@ -85,7 +86,7 @@ static void bench_one_size(const Config& cfg, size_t block) {
     opt.dir = dir;
     opt.durability = cfg.dur;
     opt.enable_cache = cfg.cache;
-    opt.segment_size = 1ull << 30;
+    opt.segment_size = 0xFFFFFFFFull;  // single segment: max capacity (just under 4 GiB)
     auto store = BlobStore::open(opt);
 
     // Payload pool (one buffer reused; content irrelevant to timing).
@@ -116,6 +117,44 @@ static void bench_one_size(const Config& cfg, size_t block) {
             std::lock_guard<std::mutex> g(lm); lat.add((b - a) * 1e6);
         });
         row("conc-write", block, cfg.threads, ops, secs, double(ops) * block, lat);
+    }
+
+    // ---- BATCH: appendBatch / loadBatch (amortized lock + one fsync per batch) ----
+    {
+        std::string bdir = dir + "_batch";
+        (void)std::system(("rm -rf '" + bdir + "'").c_str());
+        BlobStore::Options bopt = opt;
+        bopt.dir = bdir;
+        auto bstore = BlobStore::open(bopt);
+
+        const uint64_t kBatch = 64;
+        std::vector<Index> bhandles; bhandles.reserve(ops);
+
+        LatencyVec wlat;
+        double t0 = now_s();
+        for (uint64_t i = 0; i < ops; i += kBatch) {
+            uint64_t n = std::min<uint64_t>(kBatch, ops - i);
+            std::vector<std::string_view> chunk(n, payload);
+            double a = now_s();
+            auto idxs = bstore->appendBatch(chunk);
+            wlat.add((now_s() - a) * 1e6 / n);  // per-record latency
+            for (auto& x : idxs) bhandles.push_back(x);
+        }
+        row("batch-write", block, 1, ops, now_s() - t0, double(ops) * block, wlat);
+
+        bstore = BlobStore::open(bopt);  // fresh: cold batched reads
+        LatencyVec rlat;
+        double r0 = now_s();
+        for (uint64_t i = 0; i < ops; i += kBatch) {
+            uint64_t n = std::min<uint64_t>(kBatch, ops - i);
+            std::vector<Index> ix(bhandles.begin() + i, bhandles.begin() + i + n);
+            double a = now_s();
+            auto vals = bstore->loadBatch(ix);
+            rlat.add((now_s() - a) * 1e6 / n);
+            if (vals.back()->size() != block) std::abort();
+        }
+        row("batch-read", block, 1, ops, now_s() - r0, double(ops) * block, rlat);
+        (void)std::system(("rm -rf '" + bdir + "'").c_str());
     }
 
     // Fresh store (drop cache) for honest cold reads.

@@ -5,16 +5,17 @@ that index. Built for concurrent stores/loads, crash recovery, and a read cache 
 coalesces duplicate loads.
 
 This is the same family as **Bitcask**, **Kafka log segments**, and a DB **WAL**:
-an append-only segmented log + cheap handles + checksummed records for recovery.
+a single append-only log + cheap handles + checksummed records for recovery.
 
 ## Locked design trade-offs
 
 | Axis | Choice | Consequence |
 |------|--------|-------------|
-| **Index semantics** | Opaque packed handle `(segment, offset, length)` | O(1) reads, no index to persist, trivial recovery. **Never** relocate data → no compaction/GC/delete-reclaim. |
+| **Index semantics** | Opaque packed handle `(segment, length, offset)` | O(1) reads, no index to persist, trivial recovery. **Never** relocate data → no compaction/GC/delete-reclaim. |
 | **Durability** | Group commit (batched `fsync`) | High throughput under concurrency; a crash may lose the last few ms of *un-synced* acknowledged writes. `sync()` forces a flush. |
-| **Layout** | Segmented append-only log, no GC | Sealed segments accumulate; write-once. Simple, append-fast. |
+| **Layout** | One append-only segment file, no GC | A single write-once file; `segment` is fixed at 1. Caps a store at <4 GiB (offset must fit the cache key); `store()` throws when full. |
 | **Read cache** | Sharded LRU + single-flight | Duplicate concurrent loads of the same index collapse onto one `pread`. Configurable capacity/shards; disable for raw benchmarks. |
+| **Batch API** | `appendBatch` / `loadBatch` | One offset reservation, one contiguous `pwrite`, and **one durability barrier** amortized across the whole batch. |
 
 Scope limit: **arbitrary length is supported**, but the tuned/measured path is **4K and 1M** blocks.
 
@@ -28,22 +29,26 @@ Scope limit: **arbitrary length is supported**, but the tuned/measured path is *
   \__________ 12-byte header _________/                  4-byte tail
 ```
 
-* `crc32c` covers the payload. On load we read `12 + len + 4` bytes in **one `pread`**
-  (the handle already carries `len`), then verify magic + crc + footer.
-* **Recovery** scans the tail of the active segment; the first record that fails magic/crc/
-  footer/bounds marks the truncation point (torn write from a crash). Sealed segments are trusted.
+* `crc32c` covers the **header (magic+len) and the payload** — a flip anywhere in the
+  framing, not just the payload, is caught at `load()`. On load we read `12 + len + 4`
+  bytes in **one `pread`** (the handle carries `len`), then verify magic + crc + footer.
+* **Recovery** scans from offset 0 for the last *framing-sound* record (magic ok, fits the
+  file, header `len` == footer `len`). The first record that fails framing is a torn tail
+  (crash mid-append) → truncated. A record whose framing is sound but whose **CRC** fails is
+  interior bit-rot, not a tear: it is left in place (rejected at `load()`) and the scan steps
+  over it, so corruption of one record never discards the records written after it.
 
 ## Index (the returned handle)
 
-16 bytes: `segment:u32` (1-indexed; 0 = invalid sentinel), `length:u32`, `offset:u64`.
+16 bytes: `segment:u32` (always 1; 0 = invalid sentinel), `length:u32`, `offset:u64`.
 `Index::bytes()` / `Index::from_bytes()` serialize it so callers can persist handles.
 
 ## Concurrency model
 
 * **Stores** serialize only on a tiny offset-reservation critical section (no I/O held);
   the `pwrite` happens outside the lock. Durability is batched by a background syncer thread.
-* **Loads** need no lock against writers — records are immutable once written. The segment-fd
-  registry is read-mostly (`shared_mutex`); the cache is sharded.
+* **Loads** need no lock against writers — records are immutable once written, and the single
+  segment fd is fixed after open; the cache is sharded.
 
 ## Layout
 

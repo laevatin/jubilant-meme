@@ -86,14 +86,14 @@ static uint64_t file_size(const std::string& p) {
 }
 
 // In-scope error point: a single-bit flip inside a stored payload must be caught
-// by CRC at load() time (throw), while neighbouring records still load. We flip a
-// record in a *sealed* segment so recovery (active-only) leaves it in place and the
-// detection happens purely via per-record CRC.
-TEST("bit-flip in a stored payload is caught by CRC at load") {
+// by CRC at load() time (throw), while every other record — including the ones
+// written *after* the victim — still loads. This exercises the recovery rule that
+// interior bit-rot (framing intact, CRC bad) is left in place and stepped over, so
+// it never cascades into loss of later records.
+TEST("interior bit-flip is caught at load; records before and after survive") {
     TmpDir d("bitflip");
     std::mt19937_64 rng(1);
     BlobStore::Options opt{.dir = d.path};
-    opt.segment_size = 4096;  // ~3-4 records/segment => many sealed segments
     std::vector<Index> h;
     std::vector<std::string> payloads;
     {
@@ -106,8 +106,7 @@ TEST("bit-flip in a stored payload is caught by CRC at load") {
         }
         store->sync();
     }
-    Index victim = h[0];                  // in segment 1 (sealed)
-    CHECK(victim.segment < h.back().segment);  // confirm it is sealed, not active
+    Index victim = h[10];  // a record in the middle of the single segment
     // Flip one bit in the middle of the victim's payload (after the 12-byte header).
     std::string path = seg_path(d.path, victim.segment);
     int fd = ::open(path.c_str(), O_RDWR);
@@ -121,8 +120,37 @@ TEST("bit-flip in a stored payload is caught by CRC at load") {
 
     auto store = BlobStore::open(opt);
     CHECK_THROWS(store->load(victim));          // corrupted record rejected
-    CHECK_EQ(*store->load(h[1]), payloads[1]);  // neighbour in same segment survives
-    CHECK_EQ(*store->load(h[20]), payloads[20]); // record in another segment survives
+    CHECK_EQ(*store->load(h[9]), payloads[9]);  // record before the victim survives
+    CHECK_EQ(*store->load(h[11]), payloads[11]); // record after the victim survives
+    CHECK_EQ(*store->load(h[39]), payloads[39]); // last record survives
+}
+
+// In-scope error point: a flip in the on-disk length field (now covered by the
+// CRC) must be caught at load() rather than silently mis-sizing the read. The
+// footer keeps the header/footer length copies in disagreement, so recovery treats
+// it as a torn tail; the record before it stays intact either way.
+TEST("flip in the length field is caught (CRC now covers the header)") {
+    TmpDir d("lenflip");
+    auto store0 = BlobStore::open({.dir = d.path});
+    auto a = store0->store(std::string_view("first-record"));
+    auto b = store0->store(std::string_view("second-record"));
+    store0->sync();
+    store0.reset();
+
+    // Flip a bit in b's length field (header bytes 4..8).
+    std::string path = seg_path(d.path, b.segment);
+    int fd = ::open(path.c_str(), O_RDWR);
+    CHECK(fd >= 0);
+    uint64_t off = b.offset + 5;  // inside the 4-byte length field
+    char byte = 0;
+    CHECK(::pread(fd, &byte, 1, (off_t)off) == 1);
+    byte ^= 0x01;
+    CHECK(::pwrite(fd, &byte, 1, (off_t)off) == 1);
+    ::close(fd);
+
+    auto store = BlobStore::open({.dir = d.path});
+    CHECK_EQ(*store->load(a), std::string("first-record"));  // prior record intact
+    CHECK_THROWS(store->load(b));                              // corrupt length rejected
 }
 
 // In-scope error point: a crash mid-pwrite that leaves a valid header but a

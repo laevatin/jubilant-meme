@@ -114,20 +114,57 @@ TEST("stats count stores, loads, and cache hits") {
     CHECK(s.cache_hits >= 1);
 }
 
-TEST("segment rotation: many writes span multiple segments") {
-    TmpDir d("rotate");
+TEST("store reports a single segment") {
+    TmpDir d("onesegment");
+    auto store = BlobStore::open({.dir = d.path});
+    for (int i = 0; i < 50; ++i) store->store(std::string_view("data"));
+    CHECK_EQ(store->stats().segments, (uint32_t)1);
+}
+
+TEST("store throws when the segment cap is exceeded") {
+    TmpDir d("full");
     BlobStore::Options opt{.dir = d.path};
-    opt.segment_size = 64 * 1024;  // tiny segments to force rotation
+    opt.segment_size = 4096;  // tiny cap
     auto store = BlobStore::open(opt);
-    std::mt19937_64 rng(7);
-    std::vector<std::pair<Index, std::string>> kept;
-    for (int i = 0; i < 200; ++i) {
-        auto blob = rand_blob(rng, 1000);
-        kept.push_back({store->store(blob), blob});
+    store->store(std::string(2000, 'x'));  // fits
+    CHECK_THROWS(store->store(std::string(4000, 'y')));  // would overflow the cap
+}
+
+TEST("appendBatch returns one handle per blob, all loadable") {
+    TmpDir d("batch");
+    auto store = BlobStore::open({.dir = d.path});
+    std::vector<std::string> owned = {"", "a", std::string(4096, 'Z'), "tail",
+                                      std::string(1234, '\x7F')};
+    std::vector<std::string_view> views(owned.begin(), owned.end());
+
+    auto idxs = store->appendBatch(views);
+    CHECK_EQ(idxs.size(), owned.size());
+    for (size_t i = 0; i < owned.size(); ++i) {
+        CHECK_EQ(idxs[i].length, (uint32_t)owned[i].size());
+        CHECK_EQ(*store->load(idxs[i]), owned[i]);
     }
-    CHECK(store->stats().segments >= 2);
-    for (auto& [idx, blob] : kept)
-        CHECK_EQ(*store->load(idx), blob);
+    // Batch is counted as N stores.
+    CHECK_EQ(store->stats().stores, (uint64_t)owned.size());
+    // Empty batch is a no-op.
+    CHECK(store->appendBatch({}).empty());
+}
+
+TEST("loadBatch returns values in order, survives reopen") {
+    TmpDir d("loadbatch");
+    std::vector<std::array<uint8_t, 16>> saved;
+    std::vector<std::string> owned = {"one", "two", "three", std::string(5000, 'Q')};
+    {
+        auto store = BlobStore::open({.dir = d.path});
+        std::vector<std::string_view> views(owned.begin(), owned.end());
+        for (auto& idx : store->appendBatch(views)) saved.push_back(idx.bytes());
+        store->sync();
+    }
+    auto store = BlobStore::open({.dir = d.path});
+    std::vector<Index> idxs;
+    for (auto& b : saved) idxs.push_back(Index::from_bytes(b));
+    auto vals = store->loadBatch(idxs);
+    CHECK_EQ(vals.size(), owned.size());
+    for (size_t i = 0; i < owned.size(); ++i) CHECK_EQ(*vals[i], owned[i]);
 }
 
 RUN_ALL_TESTS()
