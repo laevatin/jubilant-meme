@@ -138,7 +138,8 @@ struct BlobStore::Impl {
     };
     std::mutex commit_mu;
     std::condition_variable commit_cv;
-    std::vector<Waiter*> pending;
+    std::vector<Waiter*> pending;             // GroupCommit: writers awaiting an fsync
+    std::atomic<uint64_t> unsynced_bytes{0};  // AsyncFlush: bytes written since the last fsync
     std::thread syncer;
     std::atomic<bool> running{false};
 
@@ -210,41 +211,59 @@ struct BlobStore::Impl {
         return r;
     }
 
-    // Make a just-written region durable per the configured mode.
-    void commit() {
+    // Make a just-written region (of `bytes` payload) durable per the configured mode.
+    void commit(uint64_t bytes) {
         switch (opts.durability) {
             case Durability::GroupCommit: {
                 Waiter w;
                 { std::lock_guard<std::mutex> lk(commit_mu); pending.push_back(&w); }
                 commit_cv.notify_one();
-                w.wait();
+                w.wait();  // blocks until the syncer fsyncs this batch
                 break;
             }
             case Durability::Sync:
                 ::fsync(seg_fd);
                 n_fsyncs.fetch_add(1);
                 break;
+            case Durability::AsyncFlush: {
+                // Return immediately; just nudge the background syncer if we've piled
+                // up enough unsynced data to cross the size threshold.
+                uint64_t u = unsynced_bytes.fetch_add(bytes) + bytes;
+                if (u >= opts.async_flush_bytes) commit_cv.notify_one();
+                break;
+            }
             case Durability::OsBuffered:
                 break;
         }
     }
 
+    // One syncer serves both background modes. GroupCommit drives it via queued
+    // waiters (flush as soon as one appears); AsyncFlush drives it via the
+    // size-or-interval threshold and signals no one.
     void syncer_loop() {
+        const bool async = opts.durability == Durability::AsyncFlush;
+        const uint64_t interval = async ? opts.async_flush_interval_us
+                                        : opts.group_commit_interval_us;
+        const uint64_t threshold = opts.async_flush_bytes;
         while (running.load()) {
             std::vector<Waiter*> batch;
+            uint64_t bytes = 0;
             {
                 std::unique_lock<std::mutex> lk(commit_mu);
-                commit_cv.wait_for(lk, std::chrono::microseconds(opts.group_commit_interval_us),
-                                   [&] { return !pending.empty() || !running.load(); });
-                batch.swap(pending);
+                commit_cv.wait_for(lk, std::chrono::microseconds(interval), [&] {
+                    return !pending.empty() || unsynced_bytes.load() >= threshold || !running.load();
+                });
+                batch.swap(pending);              // size threshold OR ...
+                bytes = unsynced_bytes.exchange(0);  // ... interval timeout flushes the tail
             }
-            if (batch.empty()) continue;
+            if (batch.empty() && bytes == 0) continue;
             flush_batch(batch);
         }
-        // Drain any stragglers on shutdown.
+        // Drain on shutdown (clean close also fsyncs again via sync()).
         std::vector<Waiter*> batch;
-        { std::lock_guard<std::mutex> lk(commit_mu); batch.swap(pending); }
-        if (!batch.empty()) flush_batch(batch);
+        uint64_t bytes = 0;
+        { std::lock_guard<std::mutex> lk(commit_mu); batch.swap(pending); bytes = unsynced_bytes.exchange(0); }
+        if (!batch.empty() || bytes > 0) flush_batch(batch);
     }
 
     void flush_batch(std::vector<Waiter*>& batch) {
@@ -254,7 +273,8 @@ struct BlobStore::Impl {
     }
 
     void start_syncer() {
-        if (opts.durability == Durability::GroupCommit) {
+        if (opts.durability == Durability::GroupCommit ||
+            opts.durability == Durability::AsyncFlush) {
             running.store(true);
             syncer = std::thread([this] { syncer_loop(); });
         }
@@ -319,7 +339,7 @@ Index BlobStore::store(const void* data, size_t len) {
 
     auto r = s.reserve(total);
     pwrite_all(r.fd, buf.data(), total, r.off);
-    s.commit();
+    s.commit(total);
 
     s.n_stores.fetch_add(1);
     s.n_bytes.fetch_add(len);
@@ -343,7 +363,7 @@ std::vector<Index> BlobStore::appendBatch(const std::vector<std::string_view>& b
 
     auto r = s.reserve(total);
     pwrite_all(r.fd, buf.data(), total, r.off);
-    s.commit();
+    s.commit(total);
 
     std::vector<Index> out;
     out.reserve(blobs.size());

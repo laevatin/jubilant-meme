@@ -12,7 +12,7 @@ a single append-only log + cheap handles + checksummed records for recovery.
 | Axis | Choice | Consequence |
 |------|--------|-------------|
 | **Index semantics** | Opaque packed handle `(segment, length, offset)` | O(1) reads, no index to persist, trivial recovery. **Never** relocate data → no compaction/GC/delete-reclaim. |
-| **Durability** | Group commit (batched `fsync`) | High throughput under concurrency; a crash may lose the last few ms of *un-synced* acknowledged writes. `sync()` forces a flush. |
+| **Durability** | Four modes: `Sync`, `GroupCommit` (default), `AsyncFlush`, `OsBuffered` | `Sync`/`GroupCommit` are durable-before-return (group amortizes one `fsync` across concurrent writers). `AsyncFlush` returns after the `pwrite` and a background worker `fsync`s on a size **or** time threshold — lowest latency, bounded loss window. `sync()` forces a flush. |
 | **Layout** | One append-only segment file, no GC | A single write-once file; `segment` is fixed at 1. Caps a store at <4 GiB (offset must fit the cache key); `store()` throws when full. |
 | **Read cache** | Sharded LRU + single-flight | Duplicate concurrent loads of the same index collapse onto one `pread`. Configurable capacity/shards; disable for raw benchmarks. |
 | **Batch API** | `appendBatch` / `loadBatch` | One offset reservation, one contiguous `pwrite`, and **one durability barrier** amortized across the whole batch. |

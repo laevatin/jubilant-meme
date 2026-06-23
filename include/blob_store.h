@@ -35,8 +35,11 @@ struct Index {
 };
 
 enum class Durability {
-    GroupCommit,  // batched fsync (default) — may lose last few ms on crash
+    GroupCommit,  // batched fsync (default); store() blocks until durable — may lose last few ms on crash
     Sync,         // fsync before every store() returns — zero loss, slow
+    AsyncFlush,   // store() returns after pwrite; a background worker fsyncs once unsynced
+                  // bytes exceed async_flush_bytes OR async_flush_interval_us elapses.
+                  // Lowest write latency; a crash loses at most that window of acked writes.
     OsBuffered,   // never fsync except on close()/sync() — fastest, least safe
 };
 
@@ -48,6 +51,8 @@ public:
         Durability durability      = Durability::GroupCommit;
         uint64_t   group_commit_interval_us = 1000;  // syncer fsync cadence
         size_t     group_commit_max_batch   = 1024;  // early-flush when this many waiters queue
+        uint64_t   async_flush_bytes        = 4ull << 20;  // AsyncFlush: fsync once this many unsynced bytes accumulate
+        uint64_t   async_flush_interval_us  = 2000;        // AsyncFlush: ...or this long since the last flush
         bool       enable_cache    = true;
         size_t     cache_capacity_bytes = 64ull << 20;
         size_t     cache_shards         = 16;

@@ -69,6 +69,7 @@ struct Config {
     Durability dur = Durability::GroupCommit;
     bool cache = true;
     double target_bytes_per_size = 512.0 * 1024 * 1024;  // ~512 MiB of data per block size
+    uint64_t max_ops = 0;  // 0 = no extra cap (use the per-size defaults)
 };
 
 static void bench_one_size(const Config& cfg, size_t block) {
@@ -78,6 +79,7 @@ static void bench_one_size(const Config& cfg, size_t block) {
     // Single segment caps a store at <4 GiB; keep seq+conc+batch writes under it.
     if (block >= (1u << 20)) ops = std::min<uint64_t>(ops, 1200);
     else ops = std::min<uint64_t>(ops, 200000);
+    if (cfg.max_ops) ops = std::min<uint64_t>(ops, cfg.max_ops);
 
     std::string dir = cfg.dir + "/sz" + std::to_string(block);
     (void)std::system(("rm -rf '" + dir + "'").c_str());
@@ -118,6 +120,10 @@ static void bench_one_size(const Config& cfg, size_t block) {
         });
         row("conc-write", block, cfg.threads, ops, secs, double(ops) * block, lat);
     }
+
+    // fsync count for the write phases — the metric that separates durability modes.
+    std::printf("    write-phase fsyncs=%llu  (over %llu single-blob writes)\n",
+                (unsigned long long)store->stats().fsyncs, (unsigned long long)(2 * ops));
 
     // ---- BATCH: appendBatch / loadBatch (amortized lock + one fsync per batch) ----
     {
@@ -220,13 +226,16 @@ int main(int argc, char** argv) {
         if (a == "--dir") cfg.dir = next();
         else if (a == "--threads") cfg.threads = std::stoi(next());
         else if (a == "--no-cache") cfg.cache = false;
+        else if (a == "--max-ops") cfg.max_ops = std::stoull(next());
         else if (a == "--durability") {
             std::string d = next();
             cfg.dur = d == "sync" ? Durability::Sync
                     : d == "osbuffered" ? Durability::OsBuffered
+                    : d == "async" ? Durability::AsyncFlush
                     : Durability::GroupCommit;
         } else if (a == "--help") {
-            std::printf("Usage: bench [--dir P] [--threads N] [--durability group|sync|osbuffered] [--no-cache]\n");
+            std::printf("Usage: bench [--dir P] [--threads N] [--max-ops N]"
+                        " [--durability group|sync|async|osbuffered] [--no-cache]\n");
             return 0;
         }
     }

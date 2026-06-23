@@ -3,9 +3,11 @@
 #include "blob_store.h"
 #include "test_framework.h"
 
+#include <chrono>
 #include <cstdio>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace bs;
@@ -165,6 +167,32 @@ TEST("loadBatch returns values in order, survives reopen") {
     auto vals = store->loadBatch(idxs);
     CHECK_EQ(vals.size(), owned.size());
     for (size_t i = 0; i < owned.size(); ++i) CHECK_EQ(*vals[i], owned[i]);
+}
+
+TEST("AsyncFlush: background worker fsyncs on the size threshold, data survives reopen") {
+    TmpDir d("async");
+    std::array<uint8_t, 16> saved{};
+    {
+        BlobStore::Options opt{.dir = d.path};
+        opt.durability = Durability::AsyncFlush;
+        opt.async_flush_bytes = 64 * 1024;       // small size trigger
+        opt.async_flush_interval_us = 100000;    // long interval => size trigger fires first
+        auto store = BlobStore::open(opt);
+
+        // Write well past the size threshold; stores return without blocking on fsync.
+        for (int i = 0; i < 200; ++i) saved = store->store(std::string(1024, 'a')).bytes();
+
+        // The background worker should fsync without any explicit sync() from us.
+        bool flushed = false;
+        for (int i = 0; i < 100 && !flushed; ++i) {
+            if (store->stats().fsyncs > 0) flushed = true;
+            else std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(flushed);
+    }
+    // Reopen (the prior store also flushed on close) and confirm durability.
+    auto store = BlobStore::open({.dir = d.path});
+    CHECK_EQ(*store->load(Index::from_bytes(saved)), std::string(1024, 'a'));
 }
 
 RUN_ALL_TESTS()

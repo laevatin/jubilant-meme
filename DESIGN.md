@@ -72,8 +72,13 @@ back, each framed as:
 2. Under `append_mu`, reserve `[cursor, cursor+total)`; throw if it exceeds the cap;
    advance `cursor`. (Batch: reserve the whole batch's bytes once.)
 3. `pwrite` the buffer at the reserved offset (no lock held).
-4. Apply the durability barrier: group-commit (enqueue + wait for the syncer's
-   `fsync`), sync (`fsync` now), or osbuffered (nothing until `sync()`/close).
+4. Apply the durability barrier per mode:
+   - **Sync** — `fsync` inline, then return.
+   - **GroupCommit** — enqueue a waiter and block until the background syncer's
+     batched `fsync` covers it (durable-before-return, one `fsync` per concurrent batch).
+   - **AsyncFlush** — return immediately; a background worker `fsync`s once unsynced
+     bytes exceed `async_flush_bytes` **or** `async_flush_interval_us` elapses.
+   - **OsBuffered** — nothing until `sync()`/close.
 5. Return `Index{segment=1, length, offset}`.
 
 ## Read procedure
