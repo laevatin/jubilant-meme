@@ -169,6 +169,21 @@ TEST("loadBatch returns values in order, survives reopen") {
     for (size_t i = 0; i < owned.size(); ++i) CHECK_EQ(*vals[i], owned[i]);
 }
 
+TEST("evict_os_cache drops pages without affecting correctness") {
+    TmpDir d("evict");
+    auto store = BlobStore::open({.dir = d.path});
+    std::mt19937_64 rng(55);
+    std::vector<std::pair<Index, std::string>> kept;
+    for (int i = 0; i < 50; ++i) {
+        auto blob = rand_blob(rng, 1 + rng() % 9000);
+        kept.push_back({store->store(blob), blob});
+    }
+    store->evict_os_cache();  // flush + drop page cache; reads now refill from disk
+    for (auto& [idx, blob] : kept) CHECK_EQ(*store->load(idx), blob);
+    store->evict_os_cache();  // idempotent / safe to repeat
+    CHECK_EQ(*store->load(kept[0].first), kept[0].second);
+}
+
 TEST("AsyncFlush: background worker fsyncs on the size threshold, data survives reopen") {
     TmpDir d("async");
     std::array<uint8_t, 16> saved{};

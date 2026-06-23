@@ -149,6 +149,7 @@ static void bench_one_size(const Config& cfg, size_t block) {
         row("batch-write", block, 1, ops, now_s() - t0, double(ops) * block, wlat);
 
         bstore = BlobStore::open(bopt);  // fresh: cold batched reads
+        bstore->evict_os_cache();        // drop page cache so reads hit the device
         LatencyVec rlat;
         double r0 = now_s();
         for (uint64_t i = 0; i < ops; i += kBatch) {
@@ -163,10 +164,14 @@ static void bench_one_size(const Config& cfg, size_t block) {
         (void)std::system(("rm -rf '" + bdir + "'").c_str());
     }
 
-    // Fresh store (drop cache) for honest cold reads.
-    store = BlobStore::open(opt);
+    // Honest cold reads: each phase reopens (fresh, empty LRU) and drops the file's
+    // pages from the OS page cache, so the LRU is the only cache and misses hit the
+    // device. Without this, the just-written data sits warm in the page cache and the
+    // earlier read phase would warm it for the next — the numbers would measure RAM.
+    auto cold = [&] { auto s = BlobStore::open(opt); s->evict_os_cache(); return s; };
 
     // ---- READ: sequential (handles in write order) ----
+    store = cold();
     {
         LatencyVec lat; std::mutex lm;
         double secs = run_parallel(cfg.threads, ops, [&](int, uint64_t i) {
@@ -184,6 +189,7 @@ static void bench_one_size(const Config& cfg, size_t block) {
     for (uint64_t i = 0; i < ops; ++i) order[i] = i;
     std::mt19937_64 rng(99);
     std::shuffle(order.begin(), order.end(), rng);
+    store = cold();
     {
         LatencyVec lat; std::mutex lm;
         double secs = run_parallel(cfg.threads, ops, [&](int, uint64_t i) {
@@ -197,6 +203,9 @@ static void bench_one_size(const Config& cfg, size_t block) {
     }
 
     // ---- READ: cached/duplicate (hammer a small hot set => cache + single-flight) ----
+    // Fresh+cold start: the first touch of each hot key misses to the device, the rest
+    // are served by the LRU (now the only cache).
+    store = cold();
     {
         uint64_t hot = std::min<uint64_t>(ops, 64);
         uint64_t reads = ops;  // same op budget, but only `hot` distinct keys

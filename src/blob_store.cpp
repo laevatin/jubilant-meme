@@ -404,6 +404,13 @@ void BlobStore::sync() {
     if (s.seg_fd >= 0) { ::fsync(s.seg_fd); s.n_fsyncs.fetch_add(1); }
 }
 
+void BlobStore::evict_os_cache() {
+    Impl& s = *p_;
+    if (s.seg_fd < 0) return;
+    ::fsync(s.seg_fd);  // DONTNEED only evicts written-back pages; flush first
+    ::posix_fadvise(s.seg_fd, 0, 0, POSIX_FADV_DONTNEED);
+}
+
 BlobStore::Stats BlobStore::stats() const {
     Impl& s = *p_;
     Stats st;

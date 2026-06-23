@@ -135,20 +135,33 @@ array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a han
   also makes offset-only indexing safe if ever wanted.
 - **Group-commit default.** Trades a few ms of crash window for far higher write
   throughput; `sync` and `osbuffered` modes available per workload.
-- **Sharded LRU + single-flight.** Dedups the application's duplicate loads and bounds
-  read amplification without a global lock.
+- **Sharded LRU + single-flight.** Buffered I/O means the OS page cache already holds
+  recently-touched bytes, so the LRU is *not* there to keep data in RAM — it caches
+  **work**: a hit skips the `pread` syscall, the CRC pass, and the payload copy, and
+  returns a shared immutable buffer. It also coalesces the application's duplicate
+  concurrent loads (single-flight), which the page cache cannot do. Cost: hot blobs are
+  held twice (page cache + LRU).
+
+## I/O model
+
+- Reads and writes are **buffered** (no `O_DIRECT`): both go through the OS page cache.
+  Writes are made durable by `fsync` per the durability mode.
+- The LRU sits **above** the page cache. To get honest *device* read numbers the
+  benchmark calls `evict_os_cache()` (`fsync` + `posix_fadvise(DONTNEED)`) before each
+  cold read phase, so the LRU is the only cache and misses actually reach the disk.
 
 ## Performance (estimated from the design)
 
 - **Reads:** one `pread` + one CRC pass. Small blobs are syscall-bound; large blobs are
   CPU-bound on software CRC + a payload copy (≈ a few hundred MB/s/core; HW CRC + a
-  zero-copy path would lift this).
+  zero-copy path would lift this). A cache hit skips all of it.
 - **Writes:** one `pwrite` + amortized `fsync`. Throughput scales with concurrency since
   only the tiny offset reservation is serialized; the `fsync` cost is shared by the batch.
 - **Batch API:** one lock acquisition, one `pwrite`, one durability barrier for N blobs →
   tighter tail latency and far fewer `fsync`s than N single calls.
-- **Cache:** repeated loads of a hot set serve from memory (no syscall); concurrent
-  duplicates coalesce to a single underlying read.
+- **Cache:** repeated loads of a hot set serve from the LRU (no syscall/CRC/copy);
+  concurrent duplicates coalesce to a single underlying read. For 1 MiB blobs the default
+  64 MiB cache holds few entries, so a wide working set churns — size it to the workload.
 
 ## Security & permissions (within threat model)
 
@@ -163,31 +176,50 @@ array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a han
 
 ## Tests for the design (plain English)
 
-**Unit**
-- CRC32C matches known check vectors and flips are detected.
-- `Index` round-trips through 16-byte serialization; default handle is invalid.
+**Unit** (isolated, deterministic)
+- CRC32C matches known check vectors, is incremental, and catches bit flips.
+- `Index` round-trips through 16-byte serialization; the default handle is invalid.
 - Cache evicts by capacity and, under many concurrent duplicate loads, runs the loader once.
+- A blob over the segment cap makes `store()` throw; `evict_os_cache()` drops pages without
+  affecting correctness; `AsyncFlush` background-fsyncs on the size threshold.
 
-**Integration**
+**Integration** (full store, on disk)
 - Store→load round-trips for empty, tiny, 4K, 1M, and odd sizes.
-- Handles survive a close/reopen (opaque handle is self-describing).
+- Handles survive close/reopen (opaque handle is self-describing).
 - `appendBatch` returns one loadable handle per blob; `loadBatch` returns values in order
   and survives reopen.
-- A torn tail is truncated on reopen while all prior records still load and new writes work.
-- An interior bit-flip is caught at load while records before **and after** it survive.
+- Recovery: a torn tail is truncated while prior records load and new writes work; an
+  interior bit-flip and a flipped length field are caught at load while neighbours (before
+  **and after**) survive.
 
-**Stress / fuzz** (deterministic seeds)
+**Stress / fuzz** (deterministic seeds, so failures reproduce)
 - Thousands of random-sized stores with immediate readback and post-reopen checks.
 - Many threads storing/loading concurrently observe no torn or wrong bytes; all durable
   after reopen.
 - Random on-disk faults (trailing garbage, bit flips, truncation): load is always
   correct-or-throws, and pure trailing garbage loses nothing.
-- Mutation check: disabling the load-time CRC must make the corruption tests fail.
+- Mutation check: disabling the load-time CRC must make the corruption tests fail (proves
+  the tests have teeth).
 
 **Performance**
-- Benchmark matrix: sequential/concurrent write and sequential/random/cached read at 4K and
-  1M, plus batch write/read, reporting MB/s, op/s, and p50/p99 latency.
+- Benchmark matrix per durability mode: sequential/concurrent write, batch write, and
+  sequential/random/cached read at 4K and 1M, reporting MB/s, op/s, p50/p99, and the
+  write-phase `fsync` count. Each cold read phase evicts the page cache first so reads hit
+  the device, not RAM.
 
 **Report**
-- Each suite prints pass/fail per case; CI runs `ctest`. Performance runs print the matrix
-  above so regressions are visible across changes and durability modes.
+- Each suite prints pass/fail per case; CI runs `ctest`. Bench prints the matrix so
+  regressions are visible across durability modes and changes.
+
+### Is the unit suite enough?
+
+For the **functional contract and the in-scope failure points, yes** — round-trips, framing,
+recovery, cache/single-flight, batch, and the durability knobs are covered, and the fuzzer +
+mutation test guard against vacuous passing. Known **gaps** to be honest about:
+- **No true power-loss test.** Faults are injected by closing the store and mutating files,
+  which models torn writes and bit-rot but **not** loss of un-`fsync`'d data on a real crash;
+  that needs process-kill or an `fsync`-failure injection harness (out of current scope).
+- **Durability modes aren't crash-matrixed.** `GroupCommit`/`Sync` are exercised for
+  correctness but not for "returned write survives an unclean exit" across all four modes.
+- **Performance is not a unit test** — it lives in the bench and is read by a human; there is
+  no automated perf-regression gate.

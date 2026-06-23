@@ -94,6 +94,11 @@ public:
     // Force all buffered writes durable (fsync). No-op data loss window afterward.
     void sync();
 
+    // Flush the segment, then drop its pages from the OS page cache
+    // (posix_fadvise DONTNEED). Reads after this hit the device, not RAM — used to
+    // get honest cold-read benchmarks now that reads are buffered. Best-effort.
+    void evict_os_cache();
+
     Stats stats() const;
 
     BlobStore(const BlobStore&) = delete;
