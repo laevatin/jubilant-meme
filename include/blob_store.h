@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -91,6 +92,51 @@ public:
     // If any handle is bad the whole call throws. Thread-safe.
     std::vector<std::shared_ptr<const std::string>> loadBatch(const std::vector<Index>& idxs);
 
+    // ---- Forward scan (read side) -----------------------------------------
+    // Walk every record in the segment, in write order, by following the
+    // length-delimited framing from offset 0. Read-only and **bypasses the LRU**
+    // (a full scan won't evict the hot set). CRC is verified per record: a torn
+    // tail or framing break ends the scan; a framing-sound but CRC-bad record is
+    // skipped. The end is snapshotted at scan() time, so records appended after
+    // are not seen; safe to run concurrently with loads.
+    struct Record {
+        Index index;                                  // handle for this record
+        std::shared_ptr<const std::string> value;     // its bytes
+    };
+
+    class Iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = Record;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const Record*;
+        using reference = const Record&;
+
+        Iterator() = default;
+        Iterator& operator++() { advance(); return *this; }
+        reference operator*() const { return cur_; }
+        pointer operator->() const { return &cur_; }
+        bool operator==(const Iterator& o) const { return at_end_ && o.at_end_; }
+        bool operator!=(const Iterator& o) const { return !(*this == o); }
+
+    private:
+        friend class BlobStore;
+        void advance();
+        BlobStore* owner_ = nullptr;
+        uint64_t off_ = 0;
+        uint64_t end_ = 0;
+        bool at_end_ = true;
+        Record cur_;
+    };
+
+    // Range view so callers can write: for (auto& rec : store->scan()) { ... }
+    struct Scan {
+        Iterator first;
+        Iterator begin() const { return first; }
+        Iterator end() const { return Iterator{}; }
+    };
+    Scan scan();
+
     // Force all buffered writes durable (fsync). No-op data loss window afterward.
     void sync();
 
@@ -107,6 +153,9 @@ public:
 private:
     BlobStore();
     struct Impl;
+    // One step of a forward scan: read the record at `off` (< `end`), fill `out`,
+    // advance `off` past it. Returns false at the end / a torn tail. Used by Iterator.
+    bool iter_step(uint64_t& off, uint64_t end, Record& out);
     std::unique_ptr<Impl> p_;
 };
 

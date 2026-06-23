@@ -107,6 +107,7 @@ Index i        = store->store(bytes, n);                // or store(string_view)
 vector<Index> v = store->appendBatch({sv1, sv2, ...});  // one barrier for the batch
 shared_ptr<const string> b   = store->load(i);          // throws on bad/corrupt handle
 vector<shared_ptr<const string>> bs = store->loadBatch({i1, i2, ...});
+for (auto& rec : store->scan()) { rec.index; rec.value; } // forward scan, all records
 store->sync();                                          // force durability
 Stats s = store->stats();                               // counters
 array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a handle
@@ -117,7 +118,9 @@ array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a han
 - **`Index`** — 16-byte handle `{segment:u32, length:u32, offset:u64}`; `valid()`,
   `bytes()`/`from_bytes()` for serialization.
 - **`BlobStore`** — public facade (`open`, `store`, `appendBatch`, `load`, `loadBatch`,
-  `sync`, `stats`); holds a `pImpl`.
+  `scan`, `sync`, `stats`); holds a `pImpl`. `scan()` returns a forward `Iterator` range
+  (input iterator) that walks the framing from offset 0, verifies CRC, **bypasses the LRU**,
+  skips a CRC-bad record, and stops at a torn tail.
 - **`BlobStore::Impl`** — owns the segment fd + `cursor` (under `append_mu`), the
   group-commit syncer (`pending` waiters, `commit_mu/cv`, thread), the cache, and
   atomic stat counters. Contains framing, recovery, reserve, and read helpers.
@@ -188,6 +191,8 @@ array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a han
 - Handles survive close/reopen (opaque handle is self-describing).
 - `appendBatch` returns one loadable handle per blob; `loadBatch` returns values in order
   and survives reopen.
+- The forward `scan()` iterator yields every record in write order (empty store → nothing,
+  works after reopen) and skips a CRC-corrupt record while yielding its neighbours.
 - Recovery: a torn tail is truncated while prior records load and new writes work; an
   interior bit-flip and a flipped length field are caught at load while neighbours (before
   **and after**) survive.

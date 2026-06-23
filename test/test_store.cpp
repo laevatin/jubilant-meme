@@ -10,7 +10,15 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 using namespace bs;
+
+// Path of the single segment file (mirrors the store's "%06u.seg" naming, id=1).
+static std::string seg_path(const std::string& dir, uint32_t /*id*/) {
+    return dir + "/000001.seg";
+}
 
 // A unique scratch dir per test; removed on construction so each run is clean.
 struct TmpDir {
@@ -167,6 +175,80 @@ TEST("loadBatch returns values in order, survives reopen") {
     auto vals = store->loadBatch(idxs);
     CHECK_EQ(vals.size(), owned.size());
     for (size_t i = 0; i < owned.size(); ++i) CHECK_EQ(*vals[i], owned[i]);
+}
+
+TEST("forward iterator yields every record in write order") {
+    TmpDir d("iter");
+    auto store = BlobStore::open({.dir = d.path});
+    std::mt19937_64 rng(77);
+    std::vector<std::pair<Index, std::string>> expect;
+    for (int i = 0; i < 60; ++i) {
+        auto blob = rand_blob(rng, rng() % 5000);  // includes occasional empty
+        expect.push_back({store->store(blob), blob});
+    }
+    // Range-for over the scan must reproduce the stored records exactly, in order.
+    size_t i = 0;
+    for (auto& rec : store->scan()) {
+        CHECK(i < expect.size());
+        CHECK(rec.index == expect[i].first);
+        CHECK_EQ(*rec.value, expect[i].second);
+        ++i;
+    }
+    CHECK_EQ(i, expect.size());
+}
+
+TEST("forward iterator on an empty store yields nothing; works after reopen") {
+    TmpDir d("iterempty");
+    {
+        auto store = BlobStore::open({.dir = d.path});
+        size_t n = 0;
+        for (auto& rec : store->scan()) { (void)rec; ++n; }
+        CHECK_EQ(n, (size_t)0);
+        store->store(std::string_view("a"));
+        store->store(std::string_view("bb"));
+        store->sync();
+    }
+    auto store = BlobStore::open({.dir = d.path});
+    std::vector<std::string> got;
+    for (auto& rec : store->scan()) got.push_back(*rec.value);
+    CHECK_EQ(got.size(), (size_t)2);
+    CHECK_EQ(got[0], std::string("a"));
+    CHECK_EQ(got[1], std::string("bb"));
+}
+
+TEST("forward iterator skips a CRC-corrupt record but yields its neighbours") {
+    TmpDir d("iterskip");
+    std::vector<Index> h;
+    std::vector<std::string> payloads;
+    {
+        auto store = BlobStore::open({.dir = d.path});
+        for (int i = 0; i < 5; ++i) {
+            std::string p(200, char('A' + i));
+            payloads.push_back(p);
+            h.push_back(store->store(p));
+        }
+        store->sync();
+    }
+    // Corrupt the payload of record 2 (framing stays sound => iterator skips it).
+    std::string path = seg_path(d.path, h[2].segment);
+    int fd = ::open(path.c_str(), O_RDWR);
+    CHECK(fd >= 0);
+    uint64_t off = h[2].offset + 12 + h[2].length / 2;
+    char b = 0;
+    CHECK(::pread(fd, &b, 1, (off_t)off) == 1);
+    b ^= 0x10;
+    CHECK(::pwrite(fd, &b, 1, (off_t)off) == 1);
+    ::close(fd);
+
+    auto store = BlobStore::open({.dir = d.path});
+    std::vector<std::string> got;
+    for (auto& rec : store->scan()) got.push_back(*rec.value);
+    // Record 2 is skipped; 0,1,3,4 survive in order.
+    CHECK_EQ(got.size(), (size_t)4);
+    CHECK_EQ(got[0], payloads[0]);
+    CHECK_EQ(got[1], payloads[1]);
+    CHECK_EQ(got[2], payloads[3]);
+    CHECK_EQ(got[3], payloads[4]);
 }
 
 TEST("evict_os_cache drops pages without affecting correctness") {

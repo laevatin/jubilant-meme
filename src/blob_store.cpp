@@ -399,6 +399,50 @@ std::vector<std::shared_ptr<const std::string>> BlobStore::loadBatch(const std::
     return out;
 }
 
+// ---- Forward scan ----------------------------------------------------------
+
+bool BlobStore::iter_step(uint64_t& off, uint64_t end, Record& out) {
+    Impl& s = *p_;
+    std::string hdr(kHeaderSize, '\0');
+    for (;;) {
+        if (off + kHeaderSize > end) return false;
+        if (pread_all(s.seg_fd, hdr.data(), kHeaderSize, off) != kHeaderSize) return false;
+        if (get_u32(hdr.data()) != kMagic) return false;            // framing gone -> end
+        uint32_t len = get_u32(hdr.data() + 4);
+        uint64_t reclen = kHeaderSize + len + kFooterSize;
+        if (off + reclen > end) return false;                       // runs past snapshot -> end
+        std::string body(len + kFooterSize, '\0');
+        if (pread_all(s.seg_fd, body.data(), body.size(), off + kHeaderSize) != body.size())
+            return false;
+        if (get_u32(body.data() + len) != len) return false;        // len copies disagree -> end
+        uint32_t want = get_u32(hdr.data() + 8);
+        uint32_t crc = crc32c(hdr.data(), 8);              // header (magic+len)
+        crc = crc32c(body.data(), len, crc);               // payload
+        uint64_t rec_off = off;
+        off += reclen;
+        if (crc != want) continue;                                  // interior bit-rot -> skip
+        out.index = Index{kSegmentId, len, rec_off};
+        out.value = std::make_shared<const std::string>(body.substr(0, len));
+        return true;
+    }
+}
+
+void BlobStore::Iterator::advance() {
+    if (!owner_) { at_end_ = true; return; }
+    at_end_ = !owner_->iter_step(off_, end_, cur_);
+}
+
+BlobStore::Scan BlobStore::scan() {
+    Iterator it;
+    it.owner_ = this;
+    it.off_ = 0;
+    struct stat st{};
+    it.end_ = (::fstat(p_->seg_fd, &st) == 0) ? (uint64_t)st.st_size : 0;
+    it.at_end_ = false;
+    it.advance();  // position on the first record (or end, if empty)
+    return Scan{it};
+}
+
 void BlobStore::sync() {
     Impl& s = *p_;
     if (s.seg_fd >= 0) { ::fsync(s.seg_fd); s.n_fsyncs.fetch_add(1); }
