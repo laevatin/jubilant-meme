@@ -50,8 +50,29 @@ recovery, and a read cache that coalesces duplicate loads.
 
 ## File format
 
-A store directory holds one segment file `000001.seg`. Records are packed back to
-back, each framed as:
+### Directory & segment layout
+
+A store *is* a directory. It holds exactly one segment file:
+
+```
+<dir>/
+  └── 000001.seg     # the whole log; created 0644 on first open
+```
+
+- **One file, one log.** All records live in `000001.seg`; there is no separate index,
+  manifest, or write-ahead file. The segment id is fixed at `1` (`%06u.seg` naming is
+  kept so the on-disk layout is forward-compatible if rotation is ever added).
+- **The file is the index.** A handle `(segment=1, length, offset)` points straight at a
+  record's header byte, so nothing else needs to be persisted or rebuilt on open.
+- **No header/superblock.** The file begins immediately with the first record. Its length
+  is the durable cursor: valid data is `[0, last_sound_record_end)`; anything past that is
+  a torn tail. Capacity is bounded by `segment_size` (< 4 GiB).
+- **Append-only & position-addressed.** Records are written once at increasing offsets and
+  never moved or rewritten, so every offset ever returned stays valid for the file's life.
+
+### Record framing
+
+Records are packed back to back, each framed as:
 
 ```
 +--------+--------+--------+--------------+--------+
@@ -64,7 +85,11 @@ back, each framed as:
 - `magic` = `'BLOB'`; `len` = payload length; `footer` = a second copy of `len`.
 - `crc32c` (Castagnoli) covers the **header (magic+len) and the payload**, so a flip
   anywhere in the framing is caught — not just in the payload.
-- Little-endian on disk. A record occupies `12 + len + 4` bytes.
+- Little-endian on disk. A record occupies `12 + len + 4` bytes; the next record begins
+  immediately after the footer.
+- The header + footer make the stream **self-delimiting in both directions of trust**:
+  `magic` marks a record start, `len` sizes it, and `footer == len` confirms the record
+  ended where the header claimed — the basis for recovery below.
 
 ## Write procedure
 
@@ -90,14 +115,112 @@ back, each framed as:
 3. Verify: magic, header `len` == handle length, CRC over header+payload, footer.
    Any mismatch throws; otherwise return a `shared_ptr<const string>` of the payload.
 
-## Crash recovery
+## Opening a (possibly corrupted) file
 
-- On open, scan from offset 0 for the last **framing-sound** record (magic ok, fits
-  the file, header `len` == footer `len`).
-- A **framing break** = torn tail from a crash mid-append → truncate from there.
-- A record that is framing-sound but **CRC-fails** = interior bit-rot → left in place,
-  stepped over, and rejected at `load()` — so one corrupt record does not discard the
-  records written after it.
+`open()` must turn an arbitrary on-disk file — including one left by a crash mid-append or
+damaged by bit-rot — into a consistent store with a correct write cursor. It never trusts
+the file blindly; it re-derives the durable boundary by walking the framing.
+
+**Recovery scan.** Starting at offset 0, for each record read the 12-byte header and the
+4-byte footer and classify it:
+
+1. **Framing-sound** — `magic == 'BLOB'`, the record `[off, off+12+len+4)` fits within the
+   file, and `footer == len`. Accept the frame, advance `cursor` past it, continue.
+2. **Framing break** — `magic` wrong, the record would run past EOF, or `footer != len`.
+   Stop here: everything from this offset on is a **torn tail** from a crash partway
+   through an append (or trailing garbage). `ftruncate` the file to this offset and set
+   `cursor` to it. The next append starts cleanly at the boundary.
+3. **CRC mismatch but framing-sound** — the frame is well-formed but `crc32c` over
+   header+payload disagrees: **interior bit-rot** in an otherwise intact record. The record
+   is *kept in place* and stepped over (its length is trustworthy because the framing is
+   sound and CRC-checked), so records written *after* it are not discarded. It is rejected
+   later, at `load()`/`scan()` time, never returned as wrong bytes.
+
+The split between cases 2 and 3 is the key invariant: **a torn tail truncates, interior
+corruption is contained.** One bad record in the middle costs only that record, not the
+suffix of the log.
+
+**Edge cases handled on open:**
+- **Missing file / empty directory** — create `000001.seg`, `cursor = 0`, empty store.
+- **Zero-length file** — valid empty store; first append writes at offset 0.
+- **Corruption at offset 0** (bad magic in the very first header) — treated as a framing
+  break at 0: the file truncates to empty rather than mis-parsing garbage as a record.
+- **Partial header/footer at EOF** — fewer than `12 + len + 4` bytes available is a framing
+  break → truncated.
+- The recovery read goes through the page cache like any other read; `evict_os_cache()`
+  afterward gives benchmarks an honest cold start.
+
+**What recovery does *not* do:** it has no separate journal to replay and cannot recover
+data that was never `fsync`'d before a crash (see the durability modes for each mode's loss
+window). It restores *structural* consistency and a correct cursor; it does not invent lost
+writes.
+
+## Behavior under kernel panic / machine failure
+
+A **process crash** keeps the OS page cache, so anything `pwrite` reached survives
+regardless of `fsync`. A **kernel panic or power loss** is the real test: the page cache is
+volatile and gone — only bytes the device actually persisted (and acknowledged via a flush)
+survive. (We do not test this directly; this is the reasoned analysis.)
+
+**What's volatile vs durable.** Volatile and lost: the page cache, the in-memory `cursor`,
+the LRU, the group-commit queue, the syncer thread. Durable: only the bytes in
+`000001.seg` that were `fsync`'d *and* flushed by the device. Crucially, **no in-memory
+state needs to survive** — the cursor and the entire index are re-derived by the recovery
+scan, and the handle is self-describing. There is no separate index/manifest file that
+could be persisted out of order against the data, so an whole class of crash-consistency
+bugs is absent by construction.
+
+**Two physical hazards a panic adds:**
+- **Torn writes.** A `pwrite` is not atomic across a power cut. Sector writes are atomic at
+  the device, but a multi-sector record can persist partially, and the page cache may write
+  pages back **out of order** — an un-`fsync`'d region can hold an arbitrary subset of its
+  bytes.
+- **Size-vs-data ordering.** After a panic the file may be shorter than what we wrote, or
+  (on non-CoW filesystems) the extended region may expose **stale neighbor block contents**.
+
+Both are caught by the framing: `magic` + `len` + `footer == len` + `crc32c` reject a short
+file, stale/zero bytes, or a half-written record. On **btrfs** (our target) CoW means an
+append never overwrites committed records in place, data is independently checksummed, and a
+panic rolls back to the last committed transaction rather than leaving structural garbage.
+
+**Per durability mode (does an *acked* write survive a panic?):**
+
+| Mode         | Acked write survives? | Loss window on panic |
+|--------------|-----------------------|----------------------|
+| `Sync`       | **Yes** — `fsync` completes before `store()` returns | only in-flight appends the caller was never told succeeded |
+| `GroupCommit`| **Yes** — blocks until the batched `fsync` covering it completes | same as `Sync`; a writer still parked on the syncer hasn't returned |
+| `AsyncFlush` | **No (bounded)** — returns before `fsync` | up to `async_flush_bytes` **or** `async_flush_interval_us` of acked writes |
+| `OsBuffered` | **No** — durable only at `sync()`/`close()` | everything since the last explicit `sync()` |
+
+`Sync` and `GroupCommit` lose **nothing the caller was told succeeded** — that is the point
+of GroupCommit returning durable-before-return (Sync's panic guarantee at a fraction of the
+`fsync` count). `AsyncFlush`/`OsBuffered` trade a bounded, documented window of acked writes
+for throughput.
+
+**Recovery resolves every post-panic file state** into a consistent monotonic prefix: a
+framing-sound prefix is accepted; the first framing break (torn tail / stale garbage) is
+truncated; recovery **stops at the first gap**, so out-of-order persistence can never expose
+a record after a hole. In all modes the store reopens consistent, never returns wrong bytes,
+and never faults on open — modes differ only in *how long* the surviving prefix is.
+
+**Known rough edge.** Recovery checks **framing only**, not CRC, so it keeps a
+framing-sound-but-CRC-bad record in place (deliberate, to contain interior bit-rot). If a
+panic tears the *tail* such that the 12-byte header and 4-byte footer persist intact but the
+payload is half-stale, that torn record is framing-sound-but-CRC-bad: recovery **keeps** it
+(it becomes a permanent interior-corrupt record `load()` will always reject) and **continues
+past it**, possibly **resurrecting** a later record whose bytes also reached disk. This
+violates no contract — those records were never acked, and `load` still fails safe (throws,
+never wrong bytes) — but a clean "truncate the torn tail" degrades into "a stuck corrupt
+record + a resurrected straggler." Probability is low (header *and* footer must survive while
+the CRC'd middle does not). A fix would treat a CRC-bad record with nothing sound after it as
+a torn tail and truncate; recovery currently cannot distinguish interior rot from a
+sound-looking torn tail.
+
+**Caveats below our assumptions:** the guarantee is only as strong as `fsync` → device
+flush — a drive without power-loss protection that acks a flush but loses its volatile cache
+can still tear/lose "durable" data. Linux `fsync`-error semantics ("fsyncgate") can also lose
+data silently after a failed `fsync`; we account `fsync` calls but do not re-architect around
+`fsync` returning `EIO`.
 
 ## User interface (public API)
 
@@ -195,7 +318,33 @@ array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a han
   works after reopen) and skips a CRC-corrupt record while yielding its neighbours.
 - Recovery: a torn tail is truncated while prior records load and new writes work; an
   interior bit-flip and a flipped length field are caught at load while neighbours (before
-  **and after**) survive.
+  **and after**) survive. Opening an empty/missing file yields an empty store; bad magic at
+  offset 0 truncates to empty rather than mis-parsing.
+
+**Integration — thread safety** (full store, many threads, real fsync path)
+The store advertises concurrent `store`/`load`; these gate that claim. Each runs under a
+deterministic seed and asserts *no torn or wrong bytes* and full durability after reopen.
+- **Concurrent writers, unique handles.** N threads each store M distinct blobs; collect all
+  handles. Assert exactly N·M handles, **all offsets distinct and non-overlapping** (the
+  `[cursor, cursor+total)` reservation never double-allocates a byte range), and every
+  handle loads back to the blob its writer wrote.
+- **Concurrent writers + readers (read-your-writes across threads).** While writers append,
+  reader threads load handles published by writers through a shared queue; every load
+  returns the exact bytes that writer stored — never a partial/None/other record.
+- **Mixed writers + a live `scan()`.** A scan started concurrently with writers returns a
+  prefix-consistent snapshot (every record it yields is a complete, CRC-valid record up to
+  the end it snapshotted); it never observes a half-written tail.
+- **Single-flight under contention.** Many threads load the *same* cold handle at once; the
+  loader runs once (`stats().coalesced` accounts the rest), all callers get the identical
+  shared buffer, and no extra `pread` is issued.
+- **Cache eviction race.** Working set ≫ cache capacity with concurrent loads, so entries
+  are evicted while other threads still hold them; assert no use-after-free and correct
+  bytes (the `shared_ptr` keeps an evicted-but-held buffer alive).
+- **Concurrent batch + single appends interleaved.** `appendBatch` from some threads and
+  `store` from others; all handles load correctly and offsets stay disjoint.
+- **Durability under concurrency.** Repeat the concurrent-writers test in each durability
+  mode; after a clean close + reopen, every acked write (for `Sync`/`GroupCommit`: all of
+  them) is present and loadable. Run under TSan/ASan to catch data races and lifetime bugs.
 
 **Stress / fuzz** (deterministic seeds, so failures reproduce)
 - Thousands of random-sized stores with immediate readback and post-reopen checks.
