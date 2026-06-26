@@ -32,7 +32,12 @@ struct RecordWriter::Impl {
         std::condition_variable cv;
         bool done = false;
         void wait() { std::unique_lock<std::mutex> l(m); cv.wait(l, [&] { return done; }); }
-        void signal() { { std::lock_guard<std::mutex> l(m); done = true; } cv.notify_one(); }
+        // Notify *under* the lock: the Waiter is stack-allocated in commit(), so if
+        // we signaled after releasing m, the woken thread could return and destroy
+        // this condition_variable while notify_one() is still reading it (a real
+        // use-after-free that ThreadSanitizer flags). Holding m until after notify
+        // keeps the waiter parked on the mutex until we're done touching cv.
+        void signal() { std::lock_guard<std::mutex> l(m); done = true; cv.notify_one(); }
     };
     std::mutex commit_mu;
     std::condition_variable commit_cv;

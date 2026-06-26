@@ -21,7 +21,7 @@ add_executable(main app/main.cpp)
 target_link_libraries(main PRIVATE recordstore)
 
 enable_testing()
-foreach(t test_crc32c test_writer_reader test_recovery test_fuzz)
+foreach(t test_crc32c test_writer_reader test_recovery test_fuzz test_concurrency)
   add_executable(${t} test/${t}.cpp)
   target_include_directories(${t} PRIVATE include test)
   target_link_libraries(${t} PRIVATE recordstore)
