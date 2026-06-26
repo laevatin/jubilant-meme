@@ -4,6 +4,8 @@
 #include "record_format.h"
 
 #include <atomic>
+#include <iterator>
+#include <ranges>
 #include <stdexcept>
 
 namespace bs {
@@ -114,6 +116,13 @@ RecordReader::Scan RecordReader::scan() {
     it.advance();  // position on the first record (or end, if empty)
     return Scan{it};
 }
+
+// The scan really is a C++20 input range over a single-pass input iterator
+// terminated by std::default_sentinel. If either of these regresses, range-for and
+// std::ranges algorithms over scan() would silently stop compiling — assert it here.
+static_assert(std::input_iterator<RecordReader::Iterator>);
+static_assert(std::sentinel_for<std::default_sentinel_t, RecordReader::Iterator>);
+static_assert(std::ranges::input_range<RecordReader::Scan>);
 
 void RecordReader::evict_os_cache() {
     Impl& s = *p_;

@@ -41,26 +41,32 @@ public:
     // throws. Thread-safe.
     std::vector<std::string> loadBatch(const std::vector<Index>& idxs);
 
-    // ---- Forward scan -----------------------------------------------------
+    // ---- Forward scan (C++20) ---------------------------------------------
     // Walk every record in the segment, in write order, following the
     // length-delimited framing from offset 0. CRC is verified per record: a torn
     // tail / framing break ends the scan; a framing-sound but CRC-bad record is
     // skipped. The end is snapshotted at scan() time; records appended after are
     // not seen. Safe to run concurrently with a writer and with load().
+    //
+    // A single-pass C++20 `std::input_iterator`: it advertises `iterator_concept`
+    // (not the legacy `iterator_category`) and compares against a
+    // `std::default_sentinel_t` end marker rather than a same-type end iterator.
     class Iterator {
     public:
-        using iterator_category = std::input_iterator_tag;
+        using iterator_concept = std::input_iterator_tag;
         using value_type = Record;
         using difference_type = std::ptrdiff_t;
-        using pointer = const Record*;
-        using reference = const Record&;
 
         Iterator() = default;
+
+        const Record& operator*() const { return cur_; }
+        const Record* operator->() const { return &cur_; }
         Iterator& operator++() { advance(); return *this; }
-        reference operator*() const { return cur_; }
-        pointer operator->() const { return &cur_; }
-        bool operator==(const Iterator& o) const { return at_end_ && o.at_end_; }
-        bool operator!=(const Iterator& o) const { return !(*this == o); }
+        void operator++(int) { advance(); }  // single-pass: post-increment yields void
+
+        // End is reached when the scan can advance no further; compared to the
+        // sentinel, the rewritten !=/symmetric forms come for free in C++20.
+        bool operator==(std::default_sentinel_t) const { return at_end_; }
 
     private:
         friend class RecordReader;
@@ -72,10 +78,11 @@ public:
         Record cur_;
     };
 
+    // An input range over the scan: begin() is the iterator, end() is the sentinel.
     struct Scan {
         Iterator first;
         Iterator begin() const { return first; }
-        Iterator end() const { return Iterator{}; }
+        std::default_sentinel_t end() const { return std::default_sentinel; }
     };
     Scan scan();
 
