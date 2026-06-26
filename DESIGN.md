@@ -1,8 +1,11 @@
-# blobstore — Design Document
+# recordstore — Design Document
 
-A C++17 store for arbitrary-length binary blobs: write a blob, get an opaque
-**index**; load it back by that index. Built for concurrent loads/stores, crash
-recovery, and a read cache that coalesces duplicate loads.
+A C++17 store for arbitrary-length binary records: write a record, get an opaque
+**index**; load it back by that index. Built for concurrent loads/stores and crash
+recovery. It is split into two decoupled halves that share **no in-memory state** —
+a `RecordWriter` (append/durability/recovery) and a `RecordReader` (load/scan) — wired
+by a small `main` driver. They communicate only through the file on disk and the
+opaque handle.
 
 ## Assumptions
 
@@ -11,7 +14,7 @@ recovery, and a read cache that coalesces duplicate loads.
 - Hot block sizes are **4 KiB and 1 MiB**, but any size up to ~4 GiB is accepted.
 - A single store lives on **one local POSIX filesystem**; `pwrite`/`pread`/`fsync`
   behave per POSIX. One process opens a given store directory at a time.
-- The application may issue **duplicate concurrent loads** of the same index.
+- A writer and any number of readers may run concurrently on the same store.
 - Total live data per store fits in **< 4 GiB** (single-segment cap).
 
 ## Principles & key points
@@ -28,25 +31,28 @@ recovery, and a read cache that coalesces duplicate loads.
 ## Architecture
 
 ```
-        store()/appendBatch()                 load()/loadBatch()
-                |                                     |
-         frame + reserve offset                 cache lookup (sharded LRU
-         (append_mu)                             + single-flight)
-                |                                     | miss
-            pwrite (lockless, positioned)        pread + verify CRC/framing
-                |                                     |
-         durability barrier  <-- syncer thread       shared_ptr<const string>
-         (group-commit / sync / osbuffered)
-                |
-        one append-only segment file (NNNNNN.seg, id=1)
+   RecordWriter                              RecordReader
+   append()/appendBatch()                    load()/loadBatch()/scan()
+        |                                          |
+   frame + reserve offset                     ReadCache (no-op placeholder)
+   (append_mu)                                     |
+        |                                     pread + verify CRC/framing
+   pwrite (lockless, positioned)                   |
+        |                                     std::string (by value)
+   durability barrier <-- syncer thread
+   (group-commit / sync / async / osbuffered)
+        |
+   one append-only segment file (000001.seg)  <-- shared only on disk
 ```
 
+- **Writer and reader are separate objects** with their own file descriptors and no
+  shared memory; the writer owns the append cursor, the reader is read-only.
 - **Append path:** frame the record(s), reserve a byte range under a tiny mutex,
   `pwrite` outside the lock, then wait for the durability barrier.
 - **Syncer thread:** for group-commit, coalesces queued writers and issues one
-  `fsync` per batch, then wakes them.
-- **Read path:** cache hit returns immediately; a miss does one positioned `pread`,
-  validates, and populates the cache.
+  `fsync` per batch, then wakes them; for async-flush, fsyncs on a size/time threshold.
+- **Read path:** route through `ReadCache` (currently a pass-through that always misses),
+  do one positioned `pread`, validate, and return a copy of the payload.
 
 ## File format
 
@@ -91,9 +97,9 @@ Records are packed back to back, each framed as:
   `magic` marks a record start, `len` sizes it, and `footer == len` confirms the record
   ended where the header claimed — the basis for recovery below.
 
-## Write procedure
+## Write procedure (`RecordWriter::append` / `appendBatch`)
 
-1. Frame the blob into a buffer (`magic | len | crc | payload | footer`).
+1. Frame the record into a buffer (`magic | len | crc | payload | footer`).
 2. Under `append_mu`, reserve `[cursor, cursor+total)`; throw if it exceeds the cap;
    advance `cursor`. (Batch: reserve the whole batch's bytes once.)
 3. `pwrite` the buffer at the reserved offset (no lock held).
@@ -106,14 +112,18 @@ Records are packed back to back, each framed as:
    - **OsBuffered** — nothing until `sync()`/close.
 5. Return `Index{segment=1, length, offset}`.
 
-## Read procedure
+## Read procedure (`RecordReader::load` / `loadBatch` / `scan`)
 
-1. If the cache is on, look up `(segment, offset)`; on a hit return the shared bytes.
-   Concurrent misses for the same key collapse onto one loader (single-flight).
-2. On a miss, `pread` `12 + len + 4` bytes at `offset` (handle carries `len` → one
-   syscall).
+1. Route the load through `ReadCache::get_or_load`. Today it is a no-op placeholder that
+   always invokes the loader (no caching), so every load goes to disk; the seam is kept so
+   a real LRU + single-flight can return without changing the interface.
+2. `pread` `12 + len + 4` bytes at `offset` (the handle carries `len` → one syscall).
 3. Verify: magic, header `len` == handle length, CRC over header+payload, footer.
-   Any mismatch throws; otherwise return a `shared_ptr<const string>` of the payload.
+   Any mismatch throws; otherwise return a **`std::string` by value** (a copy of the
+   payload — the zero-copy `shared_ptr<const string>` path was removed for now).
+4. `scan()` snapshots the file size and walks the framing from offset 0, yielding each
+   record (CRC-verified) by value; a torn tail / framing break ends the scan, a
+   framing-sound CRC-bad record is skipped.
 
 ## Opening a (possibly corrupted) file
 
@@ -163,7 +173,7 @@ volatile and gone — only bytes the device actually persisted (and acknowledged
 survive. (We do not test this directly; this is the reasoned analysis.)
 
 **What's volatile vs durable.** Volatile and lost: the page cache, the in-memory `cursor`,
-the LRU, the group-commit queue, the syncer thread. Durable: only the bytes in
+the group-commit queue, the syncer thread. Durable: only the bytes in
 `000001.seg` that were `fsync`'d *and* flushed by the device. Crucially, **no in-memory
 state needs to survive** — the cursor and the entire index are re-derived by the recovery
 scan, and the handle is self-describing. There is no separate index/manifest file that
@@ -225,69 +235,79 @@ data silently after a failed `fsync`; we account `fsync` calls but do not re-arc
 ## User interface (public API)
 
 ```cpp
-auto store = BlobStore::open({.dir = "/path"});         // Options: durability, cache, cap
-Index i        = store->store(bytes, n);                // or store(string_view)
-vector<Index> v = store->appendBatch({sv1, sv2, ...});  // one barrier for the batch
-shared_ptr<const string> b   = store->load(i);          // throws on bad/corrupt handle
-vector<shared_ptr<const string>> bs = store->loadBatch({i1, i2, ...});
-for (auto& rec : store->scan()) { rec.index; rec.value; } // forward scan, all records
-store->sync();                                          // force durability
-Stats s = store->stats();                               // counters
+// --- write side ---
+auto w = RecordWriter::open({.dir = "/path"});          // Options: durability, cap
+Index i         = w->append(value);                     // value: const std::string&
+vector<Index> v = w->appendBatch({v1, v2, ...});        // one barrier for the batch
+w->sync();                                              // force durability
+w->close();                                             // flush + stop syncer + close fd
+RecordWriter::Stats ws = w->stats();                    // appends, bytes, fsyncs
+
+// --- read side (separate object, opens the same dir read-only) ---
+auto r = RecordReader::open({.dir = "/path"});
+std::string b              = r->load(i);                // throws on bad/corrupt handle
+vector<std::string> bs     = r->loadBatch({i1, i2, ...});
+for (auto& rec : r->scan()) { rec.index; rec.value; }   // forward scan, all records
+RecordReader::Stats rs = r->stats();                    // loads
+
 array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a handle
 ```
 
 ## Class layout
 
 - **`Index`** — 16-byte handle `{segment:u32, length:u32, offset:u64}`; `valid()`,
-  `bytes()`/`from_bytes()` for serialization.
-- **`BlobStore`** — public facade (`open`, `store`, `appendBatch`, `load`, `loadBatch`,
-  `scan`, `sync`, `stats`); holds a `pImpl`. `scan()` returns a forward `Iterator` range
-  (input iterator) that walks the framing from offset 0, verifies CRC, **bypasses the LRU**,
-  skips a CRC-bad record, and stops at a torn tail.
-- **`BlobStore::Impl`** — owns the segment fd + `cursor` (under `append_mu`), the
-  group-commit syncer (`pending` waiters, `commit_mu/cv`, thread), the cache, and
-  atomic stat counters. Contains framing, recovery, reserve, and read helpers.
-- **`ShardedLruCache`** — N shards, each a `mutex` + LRU list + map, plus an in-flight
-  map for single-flight. `get_or_load(key, loader, Outcome*)`.
+  `bytes()`/`from_bytes()` for serialization (header-only).
+- **`RecordWriter`** — `open`, `append`, `appendBatch`, `sync`, `close`, `stats`; holds a
+  `pImpl`. Its `Impl` owns the segment fd + `cursor` (under `append_mu`), the group-commit /
+  async syncer (`pending` waiters, `commit_mu/cv`, thread), recovery, and atomic counters.
+- **`RecordReader`** — `open`, `load`, `loadBatch`, `scan`, `stats`; holds a read-only fd and
+  a `ReadCache`. `scan()` returns a forward `Iterator` range (input iterator) that walks the
+  framing from offset 0, verifies CRC, skips a CRC-bad record, and stops at a torn tail.
+- **`ReadCache`** — placeholder pass-through (`get_or_load` always misses); the seam for a
+  future LRU + single-flight.
+- **`fmt` (src/record_format.h)** — internal: constants, byte helpers, `pread/pwrite_all`,
+  `segment_path`, `frame_record`. Shared by both `.cpp`s; not part of the public API.
 - **`crc32c`** — table-driven Castagnoli CRC with incremental `crc` seed.
 
 ## Design decisions
 
+- **Writer / reader split, no shared memory.** The two halves communicate only through the
+  file and the opaque handle, so a reader needs no writer state and there is no index/manifest
+  to keep in sync. Recovery rederives the cursor; the handle is self-describing.
 - **Single segment, no rotation.** Simplest correct design; one fd, no registry. Cost:
-  <4 GiB per store and `store()` throws when full.
+  <4 GiB per store and `append()` throws when full.
 - **Length kept in the handle.** Redundant with the on-disk header, but it lets a load
   size the read for **one `pread`** and gives an independent length witness.
 - **CRC covers the header.** Closes the gap where a flipped `len` could mis-size a read;
   also makes offset-only indexing safe if ever wanted.
 - **Group-commit default.** Trades a few ms of crash window for far higher write
   throughput; `sync` and `osbuffered` modes available per workload.
-- **Sharded LRU + single-flight.** Buffered I/O means the OS page cache already holds
-  recently-touched bytes, so the LRU is *not* there to keep data in RAM — it caches
-  **work**: a hit skips the `pread` syscall, the CRC pass, and the payload copy, and
-  returns a shared immutable buffer. It also coalesces the application's duplicate
-  concurrent loads (single-flight), which the page cache cannot do. Cost: hot blobs are
-  held twice (page cache + LRU).
+- **Reads by value, cache removed (for now).** `load()` returns `std::string` by value and
+  the cache is a no-op placeholder. This keeps the read path trivially correct and the writer/
+  reader split clean while the LRU + single-flight + zero-copy shared buffers are re-designed
+  behind the unchanged `ReadCache` seam. Cost: every load copies the payload and pays the
+  syscall + CRC; duplicate concurrent loads are not yet coalesced.
 
 ## I/O model
 
 - Reads and writes are **buffered** (no `O_DIRECT`): both go through the OS page cache.
   Writes are made durable by `fsync` per the durability mode.
-- The LRU sits **above** the page cache. To get honest *device* read numbers the
-  benchmark calls `evict_os_cache()` (`fsync` + `posix_fadvise(DONTNEED)`) before each
-  cold read phase, so the LRU is the only cache and misses actually reach the disk.
+- With the cache disabled, the OS page cache is the only read cache. For honest *device*
+  read numbers a reader calls `evict_os_cache()` (`posix_fadvise(DONTNEED)`) before a cold
+  read phase so misses actually reach the disk.
 
 ## Performance (estimated from the design)
 
-- **Reads:** one `pread` + one CRC pass. Small blobs are syscall-bound; large blobs are
-  CPU-bound on software CRC + a payload copy (≈ a few hundred MB/s/core; HW CRC + a
-  zero-copy path would lift this). A cache hit skips all of it.
+- **Reads:** one `pread` + one CRC pass + one payload copy out. Small records are
+  syscall-bound; large records are CPU-bound on software CRC + the copy (≈ a few hundred
+  MB/s/core; HW CRC + a zero-copy path would lift this). With no cache, repeated loads of a
+  hot record re-pay this each time (served from the page cache, so no device I/O).
 - **Writes:** one `pwrite` + amortized `fsync`. Throughput scales with concurrency since
   only the tiny offset reservation is serialized; the `fsync` cost is shared by the batch.
-- **Batch API:** one lock acquisition, one `pwrite`, one durability barrier for N blobs →
+- **Batch API:** one lock acquisition, one `pwrite`, one durability barrier for N records →
   tighter tail latency and far fewer `fsync`s than N single calls.
-- **Cache:** repeated loads of a hot set serve from the LRU (no syscall/CRC/copy);
-  concurrent duplicates coalesce to a single underlying read. For 1 MiB blobs the default
-  64 MiB cache holds few entries, so a wide working set churns — size it to the workload.
+- **Cache:** a future re-add would let repeated loads of a hot set skip syscall/CRC/copy and
+  coalesce duplicate concurrent loads, sized to the workload — not present today.
 
 ## Security & permissions (within threat model)
 
@@ -302,74 +322,70 @@ array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a han
 
 ## Tests for the design (plain English)
 
-**Unit** (isolated, deterministic)
+**Unit / functional** (`test_crc32c`, `test_writer_reader`)
 - CRC32C matches known check vectors, is incremental, and catches bit flips.
 - `Index` round-trips through 16-byte serialization; the default handle is invalid.
-- Cache evicts by capacity and, under many concurrent duplicate loads, runs the loader once.
-- A blob over the segment cap makes `store()` throw; `evict_os_cache()` drops pages without
-  affecting correctness; `AsyncFlush` background-fsyncs on the size threshold.
+- `append`→`load` round-trips for empty, tiny, 4K, 1M, and odd sizes; distinct appends get
+  distinct handles/values; the writer counts appends, the reader counts loads.
+- A record over the segment cap makes `append()` throw; `append` after `close()` throws;
+  `evict_os_cache()` drops pages without affecting correctness; `AsyncFlush` background-fsyncs
+  on the size threshold and the data survives reopen.
 
-**Integration** (full store, on disk)
-- Store→load round-trips for empty, tiny, 4K, 1M, and odd sizes.
-- Handles survive close/reopen (opaque handle is self-describing).
-- `appendBatch` returns one loadable handle per blob; `loadBatch` returns values in order
+**Integration** (full writer + reader, on disk — `test_writer_reader`)
+- Handles survive writer close → reader reopen (opaque handle is self-describing).
+- `appendBatch` returns one loadable handle per record; `loadBatch` returns values in order
   and survives reopen.
-- The forward `scan()` iterator yields every record in write order (empty store → nothing,
-  works after reopen) and skips a CRC-corrupt record while yielding its neighbours.
-- Recovery: a torn tail is truncated while prior records load and new writes work; an
-  interior bit-flip and a flipped length field are caught at load while neighbours (before
-  **and after**) survive. Opening an empty/missing file yields an empty store; bad magic at
-  offset 0 truncates to empty rather than mis-parsing.
+- The forward `scan()` yields every record in write order (empty store → nothing, works after
+  reopen) and skips a CRC-corrupt record while yielding its neighbours.
 
-**Integration — thread safety** (full store, many threads, real fsync path)
-The store advertises concurrent `store`/`load`; these gate that claim. Each runs under a
-deterministic seed and asserts *no torn or wrong bytes* and full durability after reopen.
-- **Concurrent writers, unique handles.** N threads each store M distinct blobs; collect all
-  handles. Assert exactly N·M handles, **all offsets distinct and non-overlapping** (the
-  `[cursor, cursor+total)` reservation never double-allocates a byte range), and every
-  handle loads back to the blob its writer wrote.
-- **Concurrent writers + readers (read-your-writes across threads).** While writers append,
-  reader threads load handles published by writers through a shared queue; every load
-  returns the exact bytes that writer stored — never a partial/None/other record.
-- **Mixed writers + a live `scan()`.** A scan started concurrently with writers returns a
-  prefix-consistent snapshot (every record it yields is a complete, CRC-valid record up to
-  the end it snapshotted); it never observes a half-written tail.
-- **Single-flight under contention.** Many threads load the *same* cold handle at once; the
-  loader runs once (`stats().coalesced` accounts the rest), all callers get the identical
-  shared buffer, and no extra `pread` is issued.
-- **Cache eviction race.** Working set ≫ cache capacity with concurrent loads, so entries
-  are evicted while other threads still hold them; assert no use-after-free and correct
-  bytes (the `shared_ptr` keeps an evicted-but-held buffer alive).
-- **Concurrent batch + single appends interleaved.** `appendBatch` from some threads and
-  `store` from others; all handles load correctly and offsets stay disjoint.
-- **Durability under concurrency.** Repeat the concurrent-writers test in each durability
-  mode; after a clean close + reopen, every acked write (for `Sync`/`GroupCommit`: all of
-  them) is present and loadable. Run under TSan/ASan to catch data races and lifetime bugs.
+**Integration — recovery** (`test_recovery`)
+- A torn tail is truncated by the writer on open while prior records load and new writes work;
+  an interior bit-flip and a flipped length field are caught at load while neighbours (before
+  **and after**) survive; a framing-sound CRC-bad interior record is *not* truncated (file
+  size unchanged). Partial header / truncated payload at the tail truncate exactly to the last
+  good record. Empty/missing dir yields a usable store; `OsBuffered` survives an explicit sync.
 
-**Stress / fuzz** (deterministic seeds, so failures reproduce)
-- Thousands of random-sized stores with immediate readback and post-reopen checks.
-- Many threads storing/loading concurrently observe no torn or wrong bytes; all durable
-  after reopen.
+**Integration — thread safety** (`test_concurrency`, run under TSan/ASan)
+These gate the concurrent-`append` / concurrent-`load`+`scan` claims; each asserts *no torn or
+wrong bytes* and (where applicable) durability after reopen. **Implemented** — and TSan caught
+a real stack-`Waiter` condition-variable use-after-free in group commit, now fixed.
+- **Concurrent writers, disjoint ranges.** N threads each append M records; assert N·M
+  handles with **distinct, non-overlapping** byte ranges (the `[cursor, cursor+total)`
+  reservation never double-allocates), and every handle loads back exactly.
+- **Concurrent writers + readers (read-your-writes across threads).** While writers append and
+  publish handles to a shared list, reader threads load random published handles; every load
+  returns the exact bytes that writer stored.
+- **Live `scan()` during writes.** A scan run concurrently with a writer only ever yields
+  complete, CRC-valid records matching what was written; the record count is monotonic and the
+  final scan sees all records.
+- **Interleaved `append` + `appendBatch`.** Some threads append singly, others in batches; all
+  handles stay disjoint and load back.
+- **Durability under concurrency.** Concurrent `GroupCommit` appends all survive a clean close
+  + reopen (every acked write present).
+- *(Single-flight / cache-eviction races are out of scope while the cache is a no-op
+  placeholder; they return when the LRU does.)*
+
+**Stress / fuzz** (`test_fuzz`, deterministic seeds so failures reproduce)
+- Thousands of random-sized appends with immediate readback and post-reopen checks.
+- Many threads appending/loading concurrently observe no torn or wrong bytes; reserved offsets
+  are disjoint; all durable after reopen.
 - Random on-disk faults (trailing garbage, bit flips, truncation): load is always
   correct-or-throws, and pure trailing garbage loses nothing.
-- Mutation check: disabling the load-time CRC must make the corruption tests fail (proves
-  the tests have teeth).
 
-**Performance**
-- Benchmark matrix per durability mode: sequential/concurrent write, batch write, and
-  sequential/random/cached read at 4K and 1M, reporting MB/s, op/s, p50/p99, and the
-  write-phase `fsync` count. Each cold read phase evicts the page cache first so reads hit
-  the device, not RAM.
+**Performance** (`bench`)
+- Benchmark matrix per durability mode: sequential/concurrent append, batch append, and
+  sequential/random read at 4K and 1M, reporting MB/s, op/s, p50/p99, and the write-phase
+  `fsync` count. Each cold read phase evicts the page cache first so reads hit the device.
 
 **Report**
 - Each suite prints pass/fail per case; CI runs `ctest`. Bench prints the matrix so
   regressions are visible across durability modes and changes.
 
-### Is the unit suite enough?
+### Is the suite enough?
 
 For the **functional contract and the in-scope failure points, yes** — round-trips, framing,
-recovery, cache/single-flight, batch, and the durability knobs are covered, and the fuzzer +
-mutation test guard against vacuous passing. Known **gaps** to be honest about:
+recovery, batch, the durability knobs, and concurrency (writer/reader/scan, TSan-clean) are
+covered, and the fuzzer guards against vacuous passing. Known **gaps** to be honest about:
 - **No true power-loss test.** Faults are injected by closing the store and mutating files,
   which models torn writes and bit-rot but **not** loss of un-`fsync`'d data on a real crash;
   that needs process-kill or an `fsync`-failure injection harness (out of current scope).
