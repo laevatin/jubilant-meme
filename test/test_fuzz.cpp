@@ -1,21 +1,19 @@
-// Property-based fuzzing of the store's reliability invariants.
-//
-// Three properties, each over many randomized iterations (deterministic seeds so
-// failures reproduce):
-//   1. Roundtrip: store(x) then load(handle) == x, for arbitrary sizes, across
-//      segment rotations.
-//   2. Concurrency: many threads storing/loading concurrently never observe torn
+// Property-based fuzzing of the store's reliability invariants (deterministic
+// seeds so failures reproduce):
+//   1. Roundtrip: append(x) then load(handle) == x, for arbitrary sizes.
+//   2. Concurrency: many threads appending/loading concurrently never observe torn
 //      or wrong bytes; everything survives a reopen.
 //   3. Crash/corruption: under random on-disk faults, load() is always
-//      correct-or-throws (never returns wrong bytes); and a pure trailing-garbage
-//      fault loses nothing.
-#include "blob_store.h"
+//      correct-or-throws (never returns wrong bytes); pure trailing garbage loses
+//      nothing.
+#include "record_reader.h"
+#include "record_writer.h"
 #include "test_framework.h"
 
+#include <algorithm>
 #include <atomic>
-#include <cstdio>
 #include <cstdint>
-#include <filesystem>
+#include <cstdio>
 #include <mutex>
 #include <random>
 #include <string>
@@ -27,7 +25,6 @@
 #include <unistd.h>
 
 using namespace bs;
-namespace fs = std::filesystem;
 
 struct TmpDir {
     std::string path;
@@ -37,6 +34,12 @@ struct TmpDir {
     }
     ~TmpDir() { (void)std::system(("rm -rf '" + path + "'").c_str()); }
 };
+
+static std::string seg_path(const std::string& dir) { return dir + "/000001.seg"; }
+static uint64_t fsize(const std::string& p) {
+    struct stat st{};
+    return ::stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
+}
 
 // Heavy-tailed size distribution: lots of tiny/0, some 4K-ish, occasional 1M.
 static size_t rand_size(std::mt19937_64& rng) {
@@ -53,50 +56,37 @@ static std::string rand_blob(std::mt19937_64& rng, size_t n) {
     return s;
 }
 
-static std::vector<uint32_t> seg_ids(const std::string& dir) {
-    std::vector<uint32_t> ids;
-    for (auto& e : fs::directory_iterator(dir)) {
-        auto n = e.path().filename().string();
-        if (n.size() == 10 && n.substr(6) == ".seg")
-            ids.push_back((uint32_t)std::stoul(n.substr(0, 6)));
-    }
-    return ids;
-}
-static uint64_t fsize(const std::string& p) {
-    struct stat st{};
-    return ::stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
-}
-
-// ---- Property 1: roundtrip across rotations ----
-TEST("fuzz: roundtrip for arbitrary sizes across rotations") {
+// ---- Property 1: roundtrip ----
+TEST("fuzz: roundtrip for arbitrary sizes") {
     TmpDir d("roundtrip");
     std::mt19937_64 rng(0xC0FFEE);
-    BlobStore::Options opt{.dir = d.path};
-    opt.durability = Durability::OsBuffered;  // speed; same code path
-    auto store = BlobStore::open(opt);
+    Options opt{.dir = d.path};
+    opt.durability = Durability::OsBuffered;  // speed; same write path
+    auto w = RecordWriter::open(opt);
+    auto r = RecordReader::open(opt);
 
     std::vector<std::pair<Index, std::string>> kept;
     for (int i = 0; i < 2500; ++i) {
         auto blob = rand_blob(rng, rand_size(rng));
-        auto idx = store->store(blob);
+        auto idx = w->append(blob);
         CHECK_EQ(idx.length, (uint32_t)blob.size());
-        CHECK_EQ(*store->load(idx), blob);  // immediate readback
+        CHECK_EQ(r->load(idx), blob);  // immediate readback through a separate reader
         if (blob.size() < 4096) kept.emplace_back(idx, std::move(blob));
     }
 
-    // Durability across a reopen for the retained sample.
-    store->sync();
-    store.reset();
-    auto store2 = BlobStore::open(opt);
-    for (auto& [idx, blob] : kept) CHECK_EQ(*store2->load(idx), blob);
+    w->sync();
+    w->close();
+    auto r2 = RecordReader::open(opt);
+    for (auto& [idx, blob] : kept) CHECK_EQ(r2->load(idx), blob);  // durable across reopen
 }
 
 // ---- Property 2: concurrency safety ----
-TEST("fuzz: concurrent stores/loads never tear; survive reopen") {
+TEST("fuzz: concurrent appends/loads never tear; survive reopen") {
     TmpDir d("concurrent");
-    BlobStore::Options opt{.dir = d.path};
+    Options opt{.dir = d.path};
     opt.durability = Durability::OsBuffered;
-    auto store = BlobStore::open(opt);
+    auto w = RecordWriter::open(opt);
+    auto r = RecordReader::open(opt);
 
     const int kThreads = 8, kPerThread = 400;
     std::mutex mu;
@@ -110,12 +100,11 @@ TEST("fuzz: concurrent stores/loads never tear; survive reopen") {
             std::vector<std::pair<Index, std::string>> mine;
             for (int i = 0; i < kPerThread; ++i) {
                 auto blob = rand_blob(rng, rng() % 20000);
-                auto idx = store->store(blob);
-                if (*store->load(idx) != blob) bad = true;  // own readback
-                // Occasionally re-read an earlier blob of ours.
+                auto idx = w->append(blob);
+                if (r->load(idx) != blob) bad = true;  // own readback
                 if (!mine.empty() && (rng() & 7) == 0) {
                     auto& [pi, pb] = mine[rng() % mine.size()];
-                    if (*store->load(pi) != pb) bad = true;
+                    if (r->load(pi) != pb) bad = true;
                 }
                 mine.emplace_back(idx, std::move(blob));
             }
@@ -124,44 +113,48 @@ TEST("fuzz: concurrent stores/loads never tear; survive reopen") {
         });
     for (auto& th : ts) th.join();
     CHECK(!bad.load());
-    CHECK_EQ(store->stats().stores, (uint64_t)(kThreads * kPerThread));
+    CHECK_EQ(w->stats().appends, (uint64_t)(kThreads * kPerThread));
 
-    store->sync();
-    store.reset();
-    auto store2 = BlobStore::open(opt);
-    for (auto& [idx, blob] : all) CHECK_EQ(*store2->load(idx), blob);  // all durable
+    // Every offset reserved must be distinct and non-overlapping.
+    std::sort(all.begin(), all.end(),
+              [](auto& a, auto& b) { return a.first.offset < b.first.offset; });
+    for (size_t i = 1; i < all.size(); ++i) {
+        uint64_t prev_end = all[i - 1].first.offset + 12 + all[i - 1].first.length + 4;
+        CHECK(all[i].first.offset >= prev_end);  // no two records share a byte range
+    }
+
+    w->sync();
+    w->close();
+    auto r2 = RecordReader::open(opt);
+    for (auto& [idx, blob] : all) CHECK_EQ(r2->load(idx), blob);  // all durable
 }
 
 // ---- Property 3: crash/corruption invariants ----
-//
-// Faults applied to the closed store's files:
 //   APPEND_TAIL  trailing garbage (the common partial-write crash)  -> lose nothing
 //   FLIP_BITS    random bit flips inside records                    -> correct-or-throw
-//   TRUNCATE     chop a segment at a random offset                  -> correct-or-throw
+//   TRUNCATE     chop the segment at a random offset                -> correct-or-throw
 TEST("fuzz: load is always correct-or-throws under random faults") {
     std::mt19937_64 rng(0xBADF00D);
     const int kIters = 80;
 
     for (int it = 0; it < kIters; ++it) {
         TmpDir d(("crash_" + std::to_string(it)).c_str());
-        BlobStore::Options opt{.dir = d.path};
+        Options opt{.dir = d.path};
         opt.durability = Durability::OsBuffered;
 
         std::vector<std::pair<Index, std::string>> recs;
         {
-            auto store = BlobStore::open(opt);
+            auto w = RecordWriter::open(opt);
             int n = 5 + (int)(rng() % 30);
             for (int i = 0; i < n; ++i) {
                 auto blob = rand_blob(rng, 1 + rng() % 4096);
-                recs.emplace_back(store->store(blob), std::move(blob));
+                recs.emplace_back(w->append(blob), std::move(blob));
             }
-            store->sync();  // everything durable before the "crash"
+            w->sync();   // everything durable before the "crash"
+            w->close();
         }
 
-        auto ids = seg_ids(d.path);
-        std::string target = d.path + "/" +
-            [&] { char b[32]; std::snprintf(b, sizeof(b), "%06u.seg", ids[rng() % ids.size()]); return std::string(b); }();
-
+        std::string target = seg_path(d.path);
         enum { APPEND_TAIL, FLIP_BITS, TRUNCATE } fault = (decltype(fault))(rng() % 3);
 
         if (fault == APPEND_TAIL) {
@@ -190,24 +183,22 @@ TEST("fuzz: load is always correct-or-throws under random faults") {
             ::truncate(target.c_str(), (off_t)(rng() % (sz + 1)));
         }
 
-        auto store = BlobStore::open(opt);
+        auto w = RecordWriter::open(opt);   // recover (truncate torn tail)
+        auto r = RecordReader::open(opt);
         for (auto& [idx, blob] : recs) {
-            std::shared_ptr<const std::string> got;
+            std::string got;
             bool threw = false;
-            try { got = store->load(idx); } catch (...) { threw = true; }
+            try { got = r->load(idx); } catch (...) { threw = true; }
             if (!threw) {
-                // THE core reliability invariant: if it returns, it must be exact.
-                if (*got != blob)
+                if (got != blob)  // THE core invariant: if it returns, it must be exact
                     throw tf::AssertFail("load returned WRONG bytes under fault " +
                                          std::to_string((int)fault));
             } else if (fault == APPEND_TAIL) {
-                // Trailing garbage must never cost us a durably-stored record.
                 throw tf::AssertFail("APPEND_TAIL lost a record that should survive");
             }
         }
-        // Store remains usable after recovery.
-        auto fresh = store->store(std::string_view("post-recovery"));
-        CHECK_EQ(*store->load(fresh), std::string("post-recovery"));
+        auto fresh = w->append("post-recovery");  // store remains usable
+        CHECK_EQ(r->load(fresh), std::string("post-recovery"));
     }
 }
 
