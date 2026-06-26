@@ -267,7 +267,9 @@ array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a han
   future LRU + single-flight.
 - **`fmt` (src/record_format.h)** — internal: constants, byte helpers, `pread/pwrite_all`,
   `segment_path`, `frame_record`. Shared by both `.cpp`s; not part of the public API.
-- **`crc32c`** — table-driven Castagnoli CRC with incremental `crc` seed.
+- **`crc32c`** — Castagnoli CRC with incremental `crc` seed. Uses the x86 SSE4.2 `crc32`
+  instruction when the CPU advertises it (runtime-detected once), with a table-driven
+  software fallback; both paths give identical values.
 
 ## Design decisions
 
@@ -299,9 +301,10 @@ array<uint8_t,16> h = i.bytes();  Index::from_bytes(h); // persist/restore a han
 ## Performance (estimated from the design)
 
 - **Reads:** one `pread` + one CRC pass + one payload copy out. Small records are
-  syscall-bound; large records are CPU-bound on software CRC + the copy (≈ a few hundred
-  MB/s/core; HW CRC + a zero-copy path would lift this). With no cache, repeated loads of a
-  hot record re-pay this each time (served from the page cache, so no device I/O).
+  syscall-bound; large records are CPU-bound on the CRC + the copy. CRC uses the SSE4.2
+  `crc32` instruction (multiple GB/s/core), so for large records the payload copy now
+  dominates; a zero-copy path would lift it further. With no cache, repeated loads of a hot
+  record re-pay this each time (served from the page cache, so no device I/O).
 - **Writes:** one `pwrite` + amortized `fsync`. Throughput scales with concurrency since
   only the tiny offset reservation is serialized; the `fsync` cost is shared by the batch.
 - **Batch API:** one lock acquisition, one `pwrite`, one durability barrier for N records →
