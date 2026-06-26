@@ -5,11 +5,11 @@
 // only ever yields complete, CRC-valid records. Best run under TSan/ASan.
 #include "record_reader.h"
 #include "record_writer.h"
-#include "test_framework.h"
+
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <atomic>
-#include <cstdio>
 #include <mutex>
 #include <random>
 #include <string>
@@ -40,7 +40,7 @@ static std::string make_value(int t, int i) {
 
 // Concurrent writers: every reserved range is distinct and non-overlapping, and
 // every record loads back to exactly what its writer wrote.
-TEST("concurrent writers reserve disjoint ranges; all records load back") {
+TEST(Concurrency, WritersReserveDisjointRanges) {
     TmpDir d("writers");
     Options opt{.dir = d.path};
     opt.durability = Durability::OsBuffered;
@@ -63,25 +63,23 @@ TEST("concurrent writers reserve disjoint ranges; all records load back") {
         });
     for (auto& th : ts) th.join();
 
-    CHECK_EQ(all.size(), (size_t)(kThreads * kPer));
-    CHECK_EQ(w->stats().appends, (uint64_t)(kThreads * kPer));
+    ASSERT_EQ(all.size(), (size_t)(kThreads * kPer));
+    EXPECT_EQ(w->stats().appends, (uint64_t)(kThreads * kPer));
 
-    // Disjoint, non-overlapping ranges.
     std::sort(all.begin(), all.end(),
               [](auto& a, auto& b) { return a.first.offset < b.first.offset; });
     for (size_t i = 1; i < all.size(); ++i) {
         uint64_t prev_end = all[i - 1].first.offset + 12 + all[i - 1].first.length + 4;
-        CHECK(all[i].first.offset >= prev_end);
+        EXPECT_GE(all[i].first.offset, prev_end);
     }
 
-    // Every record loads back exactly.
     auto r = RecordReader::open(opt);
-    for (auto& [idx, v] : all) CHECK_EQ(r->load(idx), v);
+    for (auto& [idx, v] : all) EXPECT_EQ(r->load(idx), v);
 }
 
 // Cross-thread read-your-writes: writers publish handles to a shared list while
 // reader threads concurrently load random published handles and verify bytes.
-TEST("readers see writers' records concurrently, never torn") {
+TEST(Concurrency, ReadersSeeWritersRecordsConcurrently) {
     TmpDir d("rw");
     Options opt{.dir = d.path};
     opt.durability = Durability::OsBuffered;
@@ -125,13 +123,12 @@ TEST("readers see writers' records concurrently, never torn") {
     for (auto& th : ts) th.join();
     done.store(true);
     for (auto& th : rs) th.join();
-    CHECK(!bad.load());
+    EXPECT_FALSE(bad.load());
 }
 
-// A scan run concurrently with a writer must only yield complete, CRC-valid
-// records (CRC is checked inside scan), each matching what was written, and must
-// never throw or return wrong bytes. Record count seen is monotonic across scans.
-TEST("scan during concurrent writes yields a consistent prefix") {
+// A scan run concurrently with a writer must only yield complete, CRC-valid records
+// (CRC is checked inside scan), each matching what was written, never wrong bytes.
+TEST(Concurrency, ScanDuringWritesYieldsConsistentPrefix) {
     TmpDir d("scan");
     Options opt{.dir = d.path};
     opt.durability = Durability::OsBuffered;
@@ -161,25 +158,22 @@ TEST("scan during concurrent writes yields a consistent prefix") {
             ++seen;
             std::lock_guard<std::mutex> lk(mu);
             auto it = expect.find(rec.index.offset);
-            // A scanned record must match what the writer wrote at that offset
-            // (it may race ahead of the publish, so only check when present).
             if (it != expect.end() && it->second != rec.value) bad = true;
         }
         max_seen = std::max(max_seen, seen);
     }
     writer.join();
-    CHECK(!bad.load());
+    EXPECT_FALSE(bad.load());
 
-    // Final scan must see every record, in order.
     size_t final_seen = 0;
     for (const auto& rec : r->scan()) { (void)rec; ++final_seen; }
-    CHECK_EQ(final_seen, (size_t)kTotal);
-    CHECK(max_seen <= final_seen);
+    EXPECT_EQ(final_seen, (size_t)kTotal);
+    EXPECT_LE(max_seen, final_seen);
 }
 
 // Interleaved single appends and batched appends from many threads: all handles
 // stay disjoint and load back.
-TEST("interleaved append and appendBatch stay disjoint and loadable") {
+TEST(Concurrency, InterleavedAppendAndAppendBatch) {
     TmpDir d("mixed");
     Options opt{.dir = d.path};
     opt.durability = Durability::OsBuffered;
@@ -213,15 +207,15 @@ TEST("interleaved append and appendBatch stay disjoint and loadable") {
               [](auto& a, auto& b) { return a.first.offset < b.first.offset; });
     for (size_t i = 1; i < all.size(); ++i) {
         uint64_t prev_end = all[i - 1].first.offset + 12 + all[i - 1].first.length + 4;
-        CHECK(all[i].first.offset >= prev_end);
+        EXPECT_GE(all[i].first.offset, prev_end);
     }
     auto r = RecordReader::open(opt);
-    for (auto& [idx, v] : all) CHECK_EQ(r->load(idx), v);
+    for (auto& [idx, v] : all) EXPECT_EQ(r->load(idx), v);
 }
 
 // Durability under concurrency: GroupCommit must make every acked concurrent
 // append survive a clean close + reopen.
-TEST("GroupCommit: concurrent acked appends all survive reopen") {
+TEST(Concurrency, GroupCommitAckedAppendsSurviveReopen) {
     TmpDir d("durable");
     Options opt{.dir = d.path};
     opt.durability = Durability::GroupCommit;
@@ -244,7 +238,5 @@ TEST("GroupCommit: concurrent acked appends all survive reopen") {
         w->close();
     }
     auto r = RecordReader::open(opt);
-    for (auto& [idx, v] : all) CHECK_EQ(r->load(idx), v);  // all durable
+    for (auto& [idx, v] : all) EXPECT_EQ(r->load(idx), v);  // all durable
 }
-
-RUN_ALL_TESTS()

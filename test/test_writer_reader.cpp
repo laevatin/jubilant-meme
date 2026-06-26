@@ -4,11 +4,11 @@
 // objects sharing only the file on disk.
 #include "record_reader.h"
 #include "record_writer.h"
-#include "test_framework.h"
+
+#include <gtest/gtest.h>
 
 #include <array>
 #include <chrono>
-#include <cstdio>
 #include <random>
 #include <string>
 #include <thread>
@@ -38,27 +38,27 @@ static std::string rand_blob(std::mt19937_64& rng, size_t n) {
     return s;
 }
 
-TEST("append then load roundtrips bytes") {
+TEST(WriterReader, AppendThenLoadRoundtripsBytes) {
     TmpDir d("roundtrip");
     auto w = RecordWriter::open({.dir = d.path});
     auto idx = w->append("hello world");
-    CHECK(idx.valid());
+    EXPECT_TRUE(idx.valid());
     auto r = RecordReader::open({.dir = d.path});
-    CHECK_EQ(r->load(idx), std::string("hello world"));
+    EXPECT_EQ(r->load(idx), std::string("hello world"));
 }
 
-TEST("distinct appends get distinct handles and values") {
+TEST(WriterReader, DistinctAppendsGetDistinctHandlesAndValues) {
     TmpDir d("distinct");
     auto w = RecordWriter::open({.dir = d.path});
     auto a = w->append("aaa");
     auto b = w->append("bbbb");
-    CHECK(a != b);
+    EXPECT_NE(a, b);
     auto r = RecordReader::open({.dir = d.path});
-    CHECK_EQ(r->load(a), std::string("aaa"));
-    CHECK_EQ(r->load(b), std::string("bbbb"));
+    EXPECT_EQ(r->load(a), std::string("aaa"));
+    EXPECT_EQ(r->load(b), std::string("bbbb"));
 }
 
-TEST("arbitrary lengths: empty, tiny, 4K, 1M, odd sizes") {
+TEST(WriterReader, ArbitraryLengths) {
     TmpDir d("arbitrary");
     auto w = RecordWriter::open({.dir = d.path});
     std::mt19937_64 rng(123);
@@ -70,25 +70,24 @@ TEST("arbitrary lengths: empty, tiny, 4K, 1M, odd sizes") {
     }
     auto r = RecordReader::open({.dir = d.path});
     for (auto& [idx, blob] : kept) {
-        CHECK_EQ(idx.length, (uint32_t)blob.size());
-        CHECK_EQ(r->load(idx), blob);
+        EXPECT_EQ(idx.length, (uint32_t)blob.size());
+        EXPECT_EQ(r->load(idx), blob);
     }
 }
 
-TEST("index serializes to 16 bytes and back") {
+TEST(WriterReader, IndexSerializesTo16BytesAndBack) {
     Index a{.segment = 3, .length = 4096, .offset = 123456789};
     auto bytes = a.bytes();
-    CHECK_EQ(bytes.size(), (size_t)16);
-    auto b = Index::from_bytes(bytes);
-    CHECK_EQ(a, b);
+    EXPECT_EQ(bytes.size(), (size_t)16);
+    EXPECT_EQ(Index::from_bytes(bytes), a);
 }
 
-TEST("default index is invalid") {
+TEST(WriterReader, DefaultIndexIsInvalid) {
     Index z;
-    CHECK(!z.valid());
+    EXPECT_FALSE(z.valid());
 }
 
-TEST("handles survive close/reopen (opaque handle is self-describing)") {
+TEST(WriterReader, HandlesSurviveCloseReopen) {
     TmpDir d("reopen");
     std::array<uint8_t, 16> saved{};
     {
@@ -97,69 +96,69 @@ TEST("handles survive close/reopen (opaque handle is self-describing)") {
         w->close();
     }
     auto r = RecordReader::open({.dir = d.path});
-    CHECK_EQ(r->load(Index::from_bytes(saved)), std::string("persisted"));
+    EXPECT_EQ(r->load(Index::from_bytes(saved)), std::string("persisted"));
 }
 
-TEST("load rejects a corrupt/out-of-range handle") {
+TEST(WriterReader, LoadRejectsCorruptOrOutOfRangeHandle) {
     TmpDir d("badhandle");
     auto w = RecordWriter::open({.dir = d.path});
     w->append("real");
     w->sync();
     auto r = RecordReader::open({.dir = d.path});
     Index bogus{.segment = 1, .length = 10, .offset = 99999999};  // past EOF
-    CHECK_THROWS(r->load(bogus));
+    EXPECT_ANY_THROW(r->load(bogus));
 }
 
-TEST("writer counts appends; reader counts loads") {
+TEST(WriterReader, WriterCountsAppendsReaderCountsLoads) {
     TmpDir d("stats");
     auto w = RecordWriter::open({.dir = d.path});
     auto idx = w->append("x");
     w->sync();
-    CHECK_EQ(w->stats().appends, (uint64_t)1);
-    CHECK_EQ(w->stats().segments, (uint32_t)1);
+    EXPECT_EQ(w->stats().appends, (uint64_t)1);
+    EXPECT_EQ(w->stats().segments, (uint32_t)1);
 
     auto r = RecordReader::open({.dir = d.path});
     r->load(idx);
     r->load(idx);
-    CHECK_EQ(r->stats().loads, (uint64_t)2);
+    EXPECT_EQ(r->stats().loads, (uint64_t)2);
 }
 
-TEST("append throws when the segment cap is exceeded") {
+TEST(WriterReader, AppendThrowsWhenSegmentCapExceeded) {
     TmpDir d("full");
     Options opt{.dir = d.path};
     opt.segment_size = 4096;  // tiny cap
     auto w = RecordWriter::open(opt);
-    w->append(std::string(2000, 'x'));                    // fits
-    CHECK_THROWS(w->append(std::string(4000, 'y')));      // would overflow the cap
+    w->append(std::string(2000, 'x'));                 // fits
+    EXPECT_ANY_THROW(w->append(std::string(4000, 'y')));  // would overflow the cap
 }
 
-TEST("append after close throws") {
+TEST(WriterReader, AppendAfterCloseThrows) {
     TmpDir d("afterclose");
     auto w = RecordWriter::open({.dir = d.path});
     w->append("ok");
     w->close();
-    CHECK_THROWS(w->append("nope"));
+    EXPECT_ANY_THROW(w->append("nope"));
     w->close();  // idempotent
 }
 
-TEST("appendBatch returns one handle per blob, all loadable") {
+TEST(WriterReader, AppendBatchReturnsOneHandlePerBlob) {
     TmpDir d("batch");
     auto w = RecordWriter::open({.dir = d.path});
     std::vector<std::string> values = {"", "a", std::string(4096, 'Z'), "tail",
                                        std::string(1234, '\x7F')};
     auto idxs = w->appendBatch(values);
-    CHECK_EQ(idxs.size(), values.size());
+    ASSERT_EQ(idxs.size(), values.size());
     w->sync();
     auto r = RecordReader::open({.dir = d.path});
     for (size_t i = 0; i < values.size(); ++i) {
-        CHECK_EQ(idxs[i].length, (uint32_t)values[i].size());
-        CHECK_EQ(r->load(idxs[i]), values[i]);
+        EXPECT_EQ(idxs[i].length, (uint32_t)values[i].size());
+        EXPECT_EQ(r->load(idxs[i]), values[i]);
     }
-    CHECK_EQ(w->stats().appends, (uint64_t)values.size());
-    CHECK(w->appendBatch({}).empty());  // empty batch is a no-op
+    EXPECT_EQ(w->stats().appends, (uint64_t)values.size());
+    EXPECT_TRUE(w->appendBatch({}).empty());  // empty batch is a no-op
 }
 
-TEST("loadBatch returns values in order, survives reopen") {
+TEST(WriterReader, LoadBatchReturnsValuesInOrderSurvivesReopen) {
     TmpDir d("loadbatch");
     std::vector<std::array<uint8_t, 16>> saved;
     std::vector<std::string> values = {"one", "two", "three", std::string(5000, 'Q')};
@@ -172,11 +171,11 @@ TEST("loadBatch returns values in order, survives reopen") {
     std::vector<Index> idxs;
     for (auto& b : saved) idxs.push_back(Index::from_bytes(b));
     auto vals = r->loadBatch(idxs);
-    CHECK_EQ(vals.size(), values.size());
-    for (size_t i = 0; i < values.size(); ++i) CHECK_EQ(vals[i], values[i]);
+    ASSERT_EQ(vals.size(), values.size());
+    for (size_t i = 0; i < values.size(); ++i) EXPECT_EQ(vals[i], values[i]);
 }
 
-TEST("forward scan yields every record in write order") {
+TEST(WriterReader, ForwardScanYieldsEveryRecordInWriteOrder) {
     TmpDir d("iter");
     auto w = RecordWriter::open({.dir = d.path});
     std::mt19937_64 rng(77);
@@ -189,22 +188,22 @@ TEST("forward scan yields every record in write order") {
     auto r = RecordReader::open({.dir = d.path});
     size_t i = 0;
     for (auto& rec : r->scan()) {
-        CHECK(i < expect.size());
-        CHECK(rec.index == expect[i].first);
-        CHECK_EQ(rec.value, expect[i].second);
+        ASSERT_LT(i, expect.size());
+        EXPECT_EQ(rec.index, expect[i].first);
+        EXPECT_EQ(rec.value, expect[i].second);
         ++i;
     }
-    CHECK_EQ(i, expect.size());
+    EXPECT_EQ(i, expect.size());
 }
 
-TEST("forward scan on an empty store yields nothing; works after reopen") {
+TEST(WriterReader, ForwardScanOnEmptyStoreYieldsNothing) {
     TmpDir d("iterempty");
     {
         auto w = RecordWriter::open({.dir = d.path});
         auto r0 = RecordReader::open({.dir = d.path});
         size_t n = 0;
         for (auto& rec : r0->scan()) { (void)rec; ++n; }
-        CHECK_EQ(n, (size_t)0);
+        EXPECT_EQ(n, (size_t)0);
         w->append("a");
         w->append("bb");
         w->close();
@@ -212,12 +211,12 @@ TEST("forward scan on an empty store yields nothing; works after reopen") {
     auto r = RecordReader::open({.dir = d.path});
     std::vector<std::string> got;
     for (auto& rec : r->scan()) got.push_back(rec.value);
-    CHECK_EQ(got.size(), (size_t)2);
-    CHECK_EQ(got[0], std::string("a"));
-    CHECK_EQ(got[1], std::string("bb"));
+    ASSERT_EQ(got.size(), (size_t)2);
+    EXPECT_EQ(got[0], std::string("a"));
+    EXPECT_EQ(got[1], std::string("bb"));
 }
 
-TEST("forward scan skips a CRC-corrupt record but yields its neighbours") {
+TEST(WriterReader, ForwardScanSkipsCrcCorruptRecord) {
     TmpDir d("iterskip");
     std::vector<Index> h;
     std::vector<std::string> payloads;
@@ -232,25 +231,25 @@ TEST("forward scan skips a CRC-corrupt record but yields its neighbours") {
     }
     // Corrupt the payload of record 2 (framing stays sound => scan skips it).
     int fd = ::open(seg_path(d.path).c_str(), O_RDWR);
-    CHECK(fd >= 0);
+    ASSERT_GE(fd, 0);
     uint64_t off = h[2].offset + 12 + h[2].length / 2;
     char b = 0;
-    CHECK(::pread(fd, &b, 1, (off_t)off) == 1);
+    ASSERT_EQ(::pread(fd, &b, 1, (off_t)off), 1);
     b ^= 0x10;
-    CHECK(::pwrite(fd, &b, 1, (off_t)off) == 1);
+    ASSERT_EQ(::pwrite(fd, &b, 1, (off_t)off), 1);
     ::close(fd);
 
     auto r = RecordReader::open({.dir = d.path});
     std::vector<std::string> got;
     for (auto& rec : r->scan()) got.push_back(rec.value);
-    CHECK_EQ(got.size(), (size_t)4);
-    CHECK_EQ(got[0], payloads[0]);
-    CHECK_EQ(got[1], payloads[1]);
-    CHECK_EQ(got[2], payloads[3]);
-    CHECK_EQ(got[3], payloads[4]);
+    ASSERT_EQ(got.size(), (size_t)4);
+    EXPECT_EQ(got[0], payloads[0]);
+    EXPECT_EQ(got[1], payloads[1]);
+    EXPECT_EQ(got[2], payloads[3]);
+    EXPECT_EQ(got[3], payloads[4]);
 }
 
-TEST("evict_os_cache drops pages without affecting correctness") {
+TEST(WriterReader, EvictOsCacheDropsPagesWithoutAffectingCorrectness) {
     TmpDir d("evict");
     auto w = RecordWriter::open({.dir = d.path});
     std::mt19937_64 rng(55);
@@ -262,12 +261,12 @@ TEST("evict_os_cache drops pages without affecting correctness") {
     w->sync();
     auto r = RecordReader::open({.dir = d.path});
     r->evict_os_cache();
-    for (auto& [idx, blob] : kept) CHECK_EQ(r->load(idx), blob);
+    for (auto& [idx, blob] : kept) EXPECT_EQ(r->load(idx), blob);
     r->evict_os_cache();  // idempotent
-    CHECK_EQ(r->load(kept[0].first), kept[0].second);
+    EXPECT_EQ(r->load(kept[0].first), kept[0].second);
 }
 
-TEST("AsyncFlush: background worker fsyncs on the size threshold, data survives reopen") {
+TEST(WriterReader, AsyncFlushBackgroundFsyncsOnSizeThreshold) {
     TmpDir d("async");
     std::array<uint8_t, 16> saved{};
     {
@@ -283,11 +282,9 @@ TEST("AsyncFlush: background worker fsyncs on the size threshold, data survives 
             if (w->stats().fsyncs > 0) flushed = true;
             else std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        CHECK(flushed);
+        EXPECT_TRUE(flushed);
         w->close();
     }
     auto r = RecordReader::open({.dir = d.path});
-    CHECK_EQ(r->load(Index::from_bytes(saved)), std::string(1024, 'a'));
+    EXPECT_EQ(r->load(Index::from_bytes(saved)), std::string(1024, 'a'));
 }
-
-RUN_ALL_TESTS()

@@ -8,12 +8,12 @@
 //      nothing.
 #include "record_reader.h"
 #include "record_writer.h"
-#include "test_framework.h"
+
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <cstdio>
 #include <mutex>
 #include <random>
 #include <string>
@@ -57,7 +57,7 @@ static std::string rand_blob(std::mt19937_64& rng, size_t n) {
 }
 
 // ---- Property 1: roundtrip ----
-TEST("fuzz: roundtrip for arbitrary sizes") {
+TEST(Fuzz, RoundtripArbitrarySizes) {
     TmpDir d("roundtrip");
     std::mt19937_64 rng(0xC0FFEE);
     Options opt{.dir = d.path};
@@ -69,19 +69,19 @@ TEST("fuzz: roundtrip for arbitrary sizes") {
     for (int i = 0; i < 2500; ++i) {
         auto blob = rand_blob(rng, rand_size(rng));
         auto idx = w->append(blob);
-        CHECK_EQ(idx.length, (uint32_t)blob.size());
-        CHECK_EQ(r->load(idx), blob);  // immediate readback through a separate reader
+        ASSERT_EQ(idx.length, (uint32_t)blob.size());
+        ASSERT_EQ(r->load(idx), blob);  // immediate readback through a separate reader
         if (blob.size() < 4096) kept.emplace_back(idx, std::move(blob));
     }
 
     w->sync();
     w->close();
     auto r2 = RecordReader::open(opt);
-    for (auto& [idx, blob] : kept) CHECK_EQ(r2->load(idx), blob);  // durable across reopen
+    for (auto& [idx, blob] : kept) EXPECT_EQ(r2->load(idx), blob);  // durable across reopen
 }
 
 // ---- Property 2: concurrency safety ----
-TEST("fuzz: concurrent appends/loads never tear; survive reopen") {
+TEST(Fuzz, ConcurrentAppendsLoadsNeverTear) {
     TmpDir d("concurrent");
     Options opt{.dir = d.path};
     opt.durability = Durability::OsBuffered;
@@ -112,28 +112,28 @@ TEST("fuzz: concurrent appends/loads never tear; survive reopen") {
             for (auto& x : mine) all.push_back(std::move(x));
         });
     for (auto& th : ts) th.join();
-    CHECK(!bad.load());
-    CHECK_EQ(w->stats().appends, (uint64_t)(kThreads * kPerThread));
+    EXPECT_FALSE(bad.load());
+    EXPECT_EQ(w->stats().appends, (uint64_t)(kThreads * kPerThread));
 
     // Every offset reserved must be distinct and non-overlapping.
     std::sort(all.begin(), all.end(),
               [](auto& a, auto& b) { return a.first.offset < b.first.offset; });
     for (size_t i = 1; i < all.size(); ++i) {
         uint64_t prev_end = all[i - 1].first.offset + 12 + all[i - 1].first.length + 4;
-        CHECK(all[i].first.offset >= prev_end);  // no two records share a byte range
+        EXPECT_GE(all[i].first.offset, prev_end);  // no two records share a byte range
     }
 
     w->sync();
     w->close();
     auto r2 = RecordReader::open(opt);
-    for (auto& [idx, blob] : all) CHECK_EQ(r2->load(idx), blob);  // all durable
+    for (auto& [idx, blob] : all) EXPECT_EQ(r2->load(idx), blob);  // all durable
 }
 
 // ---- Property 3: crash/corruption invariants ----
 //   APPEND_TAIL  trailing garbage (the common partial-write crash)  -> lose nothing
 //   FLIP_BITS    random bit flips inside records                    -> correct-or-throw
 //   TRUNCATE     chop the segment at a random offset                -> correct-or-throw
-TEST("fuzz: load is always correct-or-throws under random faults") {
+TEST(Fuzz, LoadIsAlwaysCorrectOrThrowsUnderFaults) {
     std::mt19937_64 rng(0xBADF00D);
     const int kIters = 80;
 
@@ -160,21 +160,21 @@ TEST("fuzz: load is always correct-or-throws under random faults") {
         if (fault == APPEND_TAIL) {
             auto g = rand_blob(rng, 1 + rng() % 200);
             int fd = ::open(target.c_str(), O_WRONLY | O_APPEND);
-            CHECK(fd >= 0);
-            CHECK(::write(fd, g.data(), g.size()) == (ssize_t)g.size());
+            ASSERT_GE(fd, 0);
+            ASSERT_EQ(::write(fd, g.data(), g.size()), (ssize_t)g.size());
             ::close(fd);
         } else if (fault == FLIP_BITS) {
             uint64_t sz = fsize(target);
             if (sz == 0) continue;
             int fd = ::open(target.c_str(), O_RDWR);
-            CHECK(fd >= 0);
+            ASSERT_GE(fd, 0);
             int flips = 1 + (int)(rng() % 5);
             for (int k = 0; k < flips; ++k) {
                 uint64_t off = rng() % sz;
                 char byte = 0;
                 if (::pread(fd, &byte, 1, (off_t)off) == 1) {
                     byte ^= char(1u << (rng() % 8));
-                    CHECK(::pwrite(fd, &byte, 1, (off_t)off) == 1);
+                    ASSERT_EQ(::pwrite(fd, &byte, 1, (off_t)off), 1);
                 }
             }
             ::close(fd);
@@ -190,16 +190,13 @@ TEST("fuzz: load is always correct-or-throws under random faults") {
             bool threw = false;
             try { got = r->load(idx); } catch (...) { threw = true; }
             if (!threw) {
-                if (got != blob)  // THE core invariant: if it returns, it must be exact
-                    throw tf::AssertFail("load returned WRONG bytes under fault " +
-                                         std::to_string((int)fault));
+                // THE core invariant: if it returns, it must be exact.
+                EXPECT_EQ(got, blob) << "load returned WRONG bytes under fault " << (int)fault;
             } else if (fault == APPEND_TAIL) {
-                throw tf::AssertFail("APPEND_TAIL lost a record that should survive");
+                ADD_FAILURE() << "APPEND_TAIL lost a record that should survive";
             }
         }
         auto fresh = w->append("post-recovery");  // store remains usable
-        CHECK_EQ(r->load(fresh), std::string("post-recovery"));
+        EXPECT_EQ(r->load(fresh), std::string("post-recovery"));
     }
 }
-
-RUN_ALL_TESTS()

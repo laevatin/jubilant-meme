@@ -66,7 +66,7 @@ Scope limit: **arbitrary length is supported**, but the tuned path is **4K and 1
 include/   record.h  record_writer.h  record_reader.h  read_cache.h  crc32c.h
 src/       record_writer.cpp  record_reader.cpp  record_format.h (internal)
 app/       main.cpp                                  (driver: write / read / scan)
-test/      test_framework.h  test_*.cpp              (functional, recovery, fuzz, concurrency)
+test/      test_*.cpp                                (GoogleTest: functional, recovery, fuzz, concurrency)
 ```
 
 ## Build & test
