@@ -1,16 +1,21 @@
-// Spec: crash recovery. A torn write at the tail of the active segment must be
-// truncated on reopen; all fully-written prior records must remain loadable, and
-// the store must accept new writes afterward.
-#include "blob_store.h"
+// Spec: crash recovery. Recovery is the *writer's* job: opening a RecordWriter
+// scans the segment, truncates any torn tail, and rederives the cursor. A reader
+// then loads the surviving records (and rejects corrupt ones via CRC). These tests
+// inject on-disk faults into a closed store, reopen a writer to recover, and check
+// what survives.
+#include "record_reader.h"
+#include "record_writer.h"
 #include "test_framework.h"
 
+#include <array>
 #include <cstdio>
-#include <fcntl.h>
 #include <random>
 #include <string>
+#include <vector>
+
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <vector>
 
 using namespace bs;
 
@@ -23,93 +28,76 @@ struct TmpDir {
     ~TmpDir() { (void)std::system(("rm -rf '" + path + "'").c_str()); }
 };
 
-// The active segment is the highest-numbered NNNNNN.seg in the dir.
-static std::string active_segment(const std::string& dir) {
-    std::string cmd = "ls " + dir + "/*.seg 2>/dev/null | sort | tail -1";
-    FILE* f = popen(cmd.c_str(), "r");
-    char buf[4096] = {0};
-    if (f) { if (fgets(buf, sizeof(buf), f)) {} pclose(f); }
-    std::string s(buf);
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-    return s;
+// The single segment file (id=1, "%06u.seg").
+static std::string seg_path(const std::string& dir) { return dir + "/000001.seg"; }
+static uint64_t file_size(const std::string& p) {
+    struct stat st{};
+    return ::stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
 }
 
 TEST("torn tail write is truncated; prior records survive") {
     TmpDir d("torn");
     std::vector<std::array<uint8_t, 16>> handles;
     {
-        auto store = BlobStore::open({.dir = d.path});
-        for (int i = 0; i < 20; ++i) {
-            auto idx = store->store(std::string_view("record-" + std::to_string(i)));
-            handles.push_back(idx.bytes());
-        }
-        store->sync();
+        auto w = RecordWriter::open({.dir = d.path});
+        for (int i = 0; i < 20; ++i)
+            handles.push_back(w->append("record-" + std::to_string(i)).bytes());
+        w->close();
     }
 
-    // Simulate a crash mid-append: garbage bytes appended to the active segment.
-    std::string seg = active_segment(d.path);
-    CHECK(!seg.empty());
-    int fd = ::open(seg.c_str(), O_WRONLY | O_APPEND);
+    // Simulate a crash mid-append: garbage bytes appended with no valid framing.
+    int fd = ::open(seg_path(d.path).c_str(), O_WRONLY | O_APPEND);
     CHECK(fd >= 0);
-    std::string junk(37, '\xAB');  // a partial/garbage record, no valid framing
+    std::string junk(37, '\xAB');
     CHECK(::write(fd, junk.data(), junk.size()) == (ssize_t)junk.size());
     ::close(fd);
 
-    // Reopen: recovery should truncate the junk and keep all 20 good records.
-    auto store = BlobStore::open({.dir = d.path});
+    // Reopen a writer: recovery truncates the junk; new writes still work.
+    auto w = RecordWriter::open({.dir = d.path});
+    auto post = w->append("after-recovery");
+    w->sync();
+
+    auto r = RecordReader::open({.dir = d.path});
     for (auto& h : handles) {
-        auto idx = Index::from_bytes(h);
-        auto got = store->load(idx);
-        CHECK(got->rfind("record-", 0) == 0);
+        auto got = r->load(Index::from_bytes(h));
+        CHECK(got.rfind("record-", 0) == 0);
     }
-    // And new writes still work after recovery.
-    auto idx = store->store(std::string_view("after-recovery"));
-    CHECK_EQ(*store->load(idx), std::string("after-recovery"));
+    CHECK_EQ(r->load(post), std::string("after-recovery"));
 }
 
 TEST("recovery from an empty/new directory yields a usable store") {
     TmpDir d("fresh");
-    auto store = BlobStore::open({.dir = d.path});
-    auto idx = store->store(std::string_view("first"));
-    CHECK_EQ(*store->load(idx), std::string("first"));
+    auto w = RecordWriter::open({.dir = d.path});
+    auto idx = w->append("first");
+    w->sync();
+    auto r = RecordReader::open({.dir = d.path});
+    CHECK_EQ(r->load(idx), std::string("first"));
 }
 
-// Path of a specific segment id (mirrors the store's "%06u.seg" naming).
-static std::string seg_path(const std::string& dir, uint32_t id) {
-    char b[32];
-    std::snprintf(b, sizeof(b), "%06u.seg", id);
-    return dir + "/" + b;
-}
-static uint64_t file_size(const std::string& p) {
-    struct stat st{};
-    return ::stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
-}
-
-// In-scope error point: a single-bit flip inside a stored payload must be caught
-// by CRC at load() time (throw), while every other record — including the ones
-// written *after* the victim — still loads. This exercises the recovery rule that
-// interior bit-rot (framing intact, CRC bad) is left in place and stepped over, so
-// it never cascades into loss of later records.
+// In-scope error point: a single-bit flip inside a stored payload must be caught by
+// CRC at load() (throw), while every other record — including the ones written
+// *after* the victim — still loads. Exercises the recovery rule that interior
+// bit-rot (framing intact, CRC bad) is left in place and stepped over, so it never
+// cascades into loss of later records.
 TEST("interior bit-flip is caught at load; records before and after survive") {
     TmpDir d("bitflip");
     std::mt19937_64 rng(1);
-    BlobStore::Options opt{.dir = d.path};
     std::vector<Index> h;
     std::vector<std::string> payloads;
     {
-        auto store = BlobStore::open(opt);
+        auto w = RecordWriter::open({.dir = d.path});
         for (int i = 0; i < 40; ++i) {
             std::string p(1000, '\0');
             for (auto& c : p) c = char(rng() & 0xFF);
             payloads.push_back(p);
-            h.push_back(store->store(p));
+            h.push_back(w->append(p));
         }
-        store->sync();
+        w->close();
     }
-    Index victim = h[10];  // a record in the middle of the single segment
-    // Flip one bit in the middle of the victim's payload (after the 12-byte header).
-    std::string path = seg_path(d.path, victim.segment);
-    int fd = ::open(path.c_str(), O_RDWR);
+    uint64_t before = file_size(seg_path(d.path));
+
+    Index victim = h[10];
+    int fd = ::open(seg_path(d.path).c_str(), O_RDWR);
     CHECK(fd >= 0);
     uint64_t off = victim.offset + 12 + victim.length / 2;
     char byte = 0;
@@ -118,28 +106,32 @@ TEST("interior bit-flip is caught at load; records before and after survive") {
     CHECK(::pwrite(fd, &byte, 1, (off_t)off) == 1);
     ::close(fd);
 
-    auto store = BlobStore::open(opt);
-    CHECK_THROWS(store->load(victim));          // corrupted record rejected
-    CHECK_EQ(*store->load(h[9]), payloads[9]);  // record before the victim survives
-    CHECK_EQ(*store->load(h[11]), payloads[11]); // record after the victim survives
-    CHECK_EQ(*store->load(h[39]), payloads[39]); // last record survives
+    // Writer recovery must NOT truncate a framing-sound-but-CRC-bad interior record.
+    auto w = RecordWriter::open({.dir = d.path});
+    CHECK_EQ(file_size(seg_path(d.path)), before);
+    w->close();
+
+    auto r = RecordReader::open({.dir = d.path});
+    CHECK_THROWS(r->load(victim));            // corrupted record rejected
+    CHECK_EQ(r->load(h[9]), payloads[9]);     // record before the victim survives
+    CHECK_EQ(r->load(h[11]), payloads[11]);   // record after the victim survives
+    CHECK_EQ(r->load(h[39]), payloads[39]);   // last record survives
 }
 
-// In-scope error point: a flip in the on-disk length field (now covered by the
-// CRC) must be caught at load() rather than silently mis-sizing the read. The
-// footer keeps the header/footer length copies in disagreement, so recovery treats
-// it as a torn tail; the record before it stays intact either way.
+// In-scope error point: a flip in the on-disk length field (now CRC-covered) makes
+// the header/footer length copies disagree, so recovery treats it as a torn tail
+// and truncates it; the record before it stays intact.
 TEST("flip in the length field is caught (CRC now covers the header)") {
     TmpDir d("lenflip");
-    auto store0 = BlobStore::open({.dir = d.path});
-    auto a = store0->store(std::string_view("first-record"));
-    auto b = store0->store(std::string_view("second-record"));
-    store0->sync();
-    store0.reset();
+    Index a, b;
+    {
+        auto w = RecordWriter::open({.dir = d.path});
+        a = w->append("first-record");
+        b = w->append("second-record");
+        w->close();
+    }
 
-    // Flip a bit in b's length field (header bytes 4..8).
-    std::string path = seg_path(d.path, b.segment);
-    int fd = ::open(path.c_str(), O_RDWR);
+    int fd = ::open(seg_path(d.path).c_str(), O_RDWR);
     CHECK(fd >= 0);
     uint64_t off = b.offset + 5;  // inside the 4-byte length field
     char byte = 0;
@@ -148,58 +140,62 @@ TEST("flip in the length field is caught (CRC now covers the header)") {
     CHECK(::pwrite(fd, &byte, 1, (off_t)off) == 1);
     ::close(fd);
 
-    auto store = BlobStore::open({.dir = d.path});
-    CHECK_EQ(*store->load(a), std::string("first-record"));  // prior record intact
-    CHECK_THROWS(store->load(b));                              // corrupt length rejected
+    auto w = RecordWriter::open({.dir = d.path});  // recovery truncates b as a torn tail
+    w->close();
+    auto r = RecordReader::open({.dir = d.path});
+    CHECK_EQ(r->load(a), std::string("first-record"));  // prior record intact
+    CHECK_THROWS(r->load(b));                            // corrupt length rejected
 }
 
 // In-scope error point: a crash mid-pwrite that leaves a valid header but a
-// truncated payload. Recovery must drop that torn record (bounds check) and keep
-// all complete prior records; the torn record's handle then fails to load.
+// truncated payload. Recovery drops that torn record and keeps complete prior ones.
 TEST("truncated payload at the tail is dropped, prior records survive") {
     TmpDir d("truncpayload");
-    std::mt19937_64 rng(2);
-    auto store = BlobStore::open({.dir = d.path});  // default large segment: all in seg 1
     std::vector<Index> h;
     std::vector<std::string> payloads;
-    for (int i = 0; i < 20; ++i) {
-        std::string p(500, char('A' + i));
-        payloads.push_back(p);
-        h.push_back(store->store(p));
+    {
+        auto w = RecordWriter::open({.dir = d.path});
+        for (int i = 0; i < 20; ++i) {
+            std::string p(500, char('A' + i));
+            payloads.push_back(p);
+            h.push_back(w->append(p));
+        }
+        w->close();
     }
-    store->sync();
-    store.reset();  // close
 
     Index last = h.back();
-    std::string path = seg_path(d.path, last.segment);
-    // Chop the file in the middle of the last record's payload.
-    ::truncate(path.c_str(), (off_t)(last.offset + 12 + last.length / 2));
+    ::truncate(seg_path(d.path).c_str(), (off_t)(last.offset + 12 + last.length / 2));
 
-    auto store2 = BlobStore::open({.dir = d.path});
-    for (int i = 0; i < 19; ++i) CHECK_EQ(*store2->load(h[i]), payloads[i]);
-    CHECK_THROWS(store2->load(last));  // torn record gone
-    auto fresh = store2->store(std::string_view("post"));
-    CHECK_EQ(*store2->load(fresh), std::string("post"));
+    auto w = RecordWriter::open({.dir = d.path});
+    auto fresh = w->append("post");
+    w->sync();
+    auto r = RecordReader::open({.dir = d.path});
+    for (int i = 0; i < 19; ++i) CHECK_EQ(r->load(h[i]), payloads[i]);
+    CHECK_THROWS(r->load(last));  // torn record gone
+    CHECK_EQ(r->load(fresh), std::string("post"));
 }
 
 // In-scope error point: a crash that left only a partial record header (< 12 bytes)
-// at the tail. The scan's header-bounds guard must stop cleanly.
+// at the tail. The scan's header-bounds guard must stop cleanly and truncate exactly.
 TEST("partial record header at the tail is dropped") {
     TmpDir d("partialhdr");
-    auto store = BlobStore::open({.dir = d.path});
     std::vector<Index> h;
-    for (int i = 0; i < 10; ++i) h.push_back(store->store(std::string_view("rec")));
-    store->sync();
-    store.reset();
+    {
+        auto w = RecordWriter::open({.dir = d.path});
+        for (int i = 0; i < 10; ++i) h.push_back(w->append("rec"));
+        w->close();
+    }
 
     Index last = h.back();
-    std::string path = seg_path(d.path, last.segment);
-    ::truncate(path.c_str(), (off_t)(last.offset + 5));  // 5 bytes of a 12-byte header
+    ::truncate(seg_path(d.path).c_str(), (off_t)(last.offset + 5));  // 5 of 12 header bytes
 
-    auto store2 = BlobStore::open({.dir = d.path});
-    for (int i = 0; i < 9; ++i) CHECK_EQ(*store2->load(h[i]), std::string("rec"));
-    CHECK_THROWS(store2->load(last));
-    CHECK_EQ(file_size(path), last.offset);  // truncated exactly to last good record
+    auto w = RecordWriter::open({.dir = d.path});  // recovery truncates to last good record
+    w->close();
+    CHECK_EQ(file_size(seg_path(d.path)), last.offset);
+
+    auto r = RecordReader::open({.dir = d.path});
+    for (int i = 0; i < 9; ++i) CHECK_EQ(r->load(h[i]), std::string("rec"));
+    CHECK_THROWS(r->load(last));
 }
 
 // OsBuffered mode: after an explicit sync(), data must survive a clean reopen.
@@ -207,14 +203,15 @@ TEST("OsBuffered durability after explicit sync survives reopen") {
     TmpDir d("osbuffered");
     std::array<uint8_t, 16> saved{};
     {
-        BlobStore::Options opt{.dir = d.path};
+        Options opt{.dir = d.path};
         opt.durability = Durability::OsBuffered;
-        auto store = BlobStore::open(opt);
-        saved = store->store(std::string_view("buffered-then-synced")).bytes();
-        store->sync();
+        auto w = RecordWriter::open(opt);
+        saved = w->append("buffered-then-synced").bytes();
+        w->sync();
+        w->close();
     }
-    auto store = BlobStore::open({.dir = d.path});
-    CHECK_EQ(*store->load(Index::from_bytes(saved)), std::string("buffered-then-synced"));
+    auto r = RecordReader::open({.dir = d.path});
+    CHECK_EQ(r->load(Index::from_bytes(saved)), std::string("buffered-then-synced"));
 }
 
 RUN_ALL_TESTS()
