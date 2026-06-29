@@ -20,6 +20,9 @@
 
 using namespace bs;
 
+// Test-only failpoint defined in record_writer.cpp (see CloseWaitsForInFlightAppend...).
+namespace bs { namespace detail { void set_after_reserve_hook(void (*)()); } }
+
 struct TmpDir {
     std::string path;
     explicit TmpDir(const char* name) {
@@ -214,48 +217,69 @@ TEST(Concurrency, InterleavedAppendAndAppendBatch) {
     for (auto& [idx, v] : all) EXPECT_EQ(r->load(idx), v);
 }
 
-// close() racing with concurrent append()/sync(): close must wait for in-flight
-// appends and block new ones, so no thread ever pwrites/fsyncs a closed (or
-// recycled) fd. Best run under TSan, which flags the seg_fd data race if the
-// shared/exclusive locking regresses. Every append that *returned* must be durable.
-TEST(Concurrency, CloseRacesWithConcurrentAppendsAndSync) {
-    TmpDir d("closerace");
+// Deterministic close()/append() race via a test failpoint. The victim append parks
+// between reserve() and pwrite() (inside the seam), still holding the shared lifetime
+// lock, then close() runs. The correct code blocks close() on that shared lock until
+// the append finishes, so the pwrite lands on a still-open fd. The old code (no
+// lifetime lock) would ::close the fd while the append is parked, so when the victim
+// resumes it pwrites a closed/recycled fd → EBADF. We pin that this never happens.
+//
+// (The seam is what makes this deterministic rather than a flaky timing race: the
+// bad window — between reading seg_fd and issuing the pwrite — is a few instructions
+// in production, far too narrow to hit reliably from black-box stress or even TSan.)
+namespace {
+std::atomic<bool> g_arm_park{false};
+std::atomic<bool> g_victim_parked{false};
+std::atomic<bool> g_release_victim{false};
+void victim_pause_hook() {
+    bool expected = true;
+    if (!g_arm_park.compare_exchange_strong(expected, false)) return;  // only the first append parks
+    g_victim_parked.store(true);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);  // safety net
+    while (!g_release_victim.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+}
+}  // namespace
+
+TEST(Concurrency, CloseWaitsForInFlightAppendInsteadOfClosingFdUnderIt) {
+    TmpDir d("closeseam");
     Options opt{.dir = d.path};
-    opt.durability = Durability::GroupCommit;
+    opt.durability = Durability::OsBuffered;
     auto w = RecordWriter::open(opt);
 
-    std::mutex mu;
-    std::vector<std::pair<Index, std::string>> acked;
-    std::atomic<bool> go{false};
+    g_arm_park.store(true);
+    g_victim_parked.store(false);
+    g_release_victim.store(false);
+    bs::detail::set_after_reserve_hook(&victim_pause_hook);
 
-    const int kThreads = 6;
-    std::vector<std::thread> ts;
-    for (int t = 0; t < kThreads; ++t)
-        ts.emplace_back([&, t] {
-            while (!go.load()) {}  // line all threads up so the close lands mid-flight
-            std::vector<std::pair<Index, std::string>> mine;
-            for (int i = 0; i < 20000; ++i) {
-                auto v = make_value(t, i);
-                try {
-                    auto idx = w->append(v);  // throws once the writer is closed
-                    mine.emplace_back(idx, std::move(v));
-                    if ((i & 63) == 0) w->sync();  // also race sync() with close()
-                } catch (...) {
-                    break;  // closed: stop appending
-                }
-            }
-            std::lock_guard<std::mutex> lk(mu);
-            for (auto& x : mine) acked.push_back(std::move(x));
-        });
+    std::atomic<bool> fd_misuse{false};
+    std::string err;
+    Index victim_idx{};
+    std::thread victim([&] {
+        try { victim_idx = w->append(std::string(4096, 'V')); }
+        catch (const std::exception& e) { fd_misuse = true; err = e.what(); }
+    });
 
-    go.store(true);
-    std::this_thread::sleep_for(std::chrono::milliseconds(3));  // let appends ramp up
-    w->close();  // races with the appenders above
-    for (auto& th : ts) th.join();
+    while (!g_victim_parked.load()) std::this_thread::yield();  // append is parked mid-flight
 
-    // Every append that the writer acknowledged must be present and exact.
-    auto r = RecordReader::open(opt);
-    for (auto& [idx, v] : acked) EXPECT_EQ(r->load(idx), v);
+    std::thread closer([&] { w->close(); });  // runs while the append is parked
+
+    // A buggy close() would ::close the fd within this window; a correct one blocks on
+    // the shared lifetime lock and makes no such progress.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    g_release_victim.store(true);  // resume the victim -> it pwrites now
+    victim.join();
+    closer.join();
+    bs::detail::set_after_reserve_hook(nullptr);
+
+    EXPECT_FALSE(fd_misuse.load()) << "append used the fd after close(): " << err;
+
+    // The append was admitted before close(), so it must be durable.
+    if (!fd_misuse.load()) {
+        auto r = RecordReader::open(opt);
+        EXPECT_EQ(r->load(victim_idx), std::string(4096, 'V'));
+    }
 }
 
 // Durability under concurrency: GroupCommit must make every acked concurrent

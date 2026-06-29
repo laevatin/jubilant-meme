@@ -17,6 +17,18 @@ namespace bs {
 
 using namespace fmt;
 
+// Test-only failpoint: invoked inside append_records between the offset reservation
+// and the pwrite, while the shared lifetime lock is held. It lets a test park an
+// append mid-flight to exercise the close()/append() interleaving deterministically.
+// Cost in production is a single relaxed load + an (almost always not-taken) branch;
+// the pointer is null unless a test installs one via bs::detail::set_after_reserve_hook.
+namespace {
+std::atomic<void (*)()> g_after_reserve_hook{nullptr};
+}
+namespace detail {
+void set_after_reserve_hook(void (*hook)()) { g_after_reserve_hook.store(hook); }
+}
+
 struct RecordWriter::Impl {
     Options opts;
     int dir_fd = -1;
@@ -201,8 +213,11 @@ struct RecordWriter::Impl {
 
         // Hold io_mu shared across reserve+pwrite+commit so close() cannot pull the
         // fd out from under us. reserve() still throws if the store was closed first.
+        // Hold io_mu shared across reserve+pwrite+commit so close() cannot pull the
+        // fd out from under us. reserve() still throws if the store was closed first.
         std::shared_lock<std::shared_mutex> io_lock(io_mu);
         auto r = reserve(total);
+        if (auto h = g_after_reserve_hook.load(std::memory_order_relaxed)) h();  // test seam
         pwrite_all(seg_fd, buf.data(), total, r.off);
         commit(total);
 
@@ -253,6 +268,8 @@ void RecordWriter::sync() {
 void RecordWriter::close() {
     if (!p_) return;
     Impl& s = *p_;
+    // Exclusive: blocks until every in-flight append has released its shared lock,
+    // and prevents new ones from starting, so we never close a fd someone is using.
     // Exclusive: blocks until every in-flight append has released its shared lock,
     // and prevents new ones from starting, so we never close a fd someone is using.
     std::unique_lock<std::shared_mutex> io_lock(s.io_mu);
