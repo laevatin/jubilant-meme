@@ -26,7 +26,9 @@ struct RecordReader::Impl {
         if (seg_fd < 0) throw std::system_error(errno, std::generic_category(), "open segment (read)");
     }
 
-    // Read and fully validate the record addressed by idx; return its payload.
+    // Read and fully validate the record addressed by idx; return its payload. The
+    // handle carries len, so this reads the whole record in one pread, then shares
+    // the framing checks (footer + CRC) with the scan/recovery paths via check_body.
     std::string read_record(const Index& idx) {
         if (idx.segment != kSegmentId) throw std::runtime_error("unknown segment in index");
         const uint64_t total = kHeaderSize + idx.length + kFooterSize;
@@ -34,14 +36,14 @@ struct RecordReader::Impl {
         if (pread_all(seg_fd, buf.data(), total, idx.offset) != total)
             throw std::runtime_error("index out of range");
         if (get_u32(buf.data()) != kMagic) throw std::runtime_error("bad magic");
-        uint32_t len = get_u32(buf.data() + 4);
-        if (len != idx.length) throw std::runtime_error("length mismatch");
-        uint32_t want = get_u32(buf.data() + 8);
-        uint32_t crc = crc32c(buf.data(), 8);                  // header (magic+len)
-        crc = crc32c(buf.data() + kHeaderSize, len, crc);      // payload
-        if (crc != want) throw std::runtime_error("crc mismatch");
-        if (get_u32(buf.data() + kHeaderSize + len) != len) throw std::runtime_error("footer mismatch");
-        return buf.substr(kHeaderSize, len);
+        if (get_u32(buf.data() + 4) != idx.length) throw std::runtime_error("length mismatch");
+        const char* body = buf.data() + kHeaderSize;
+        switch (check_body(buf.data(), idx.length, get_u32(buf.data() + 8), body)) {
+            case BodyCheck::BadFooter: throw std::runtime_error("footer mismatch");
+            case BodyCheck::BadCrc:    throw std::runtime_error("crc mismatch");
+            case BodyCheck::Ok:        break;
+        }
+        return buf.substr(kHeaderSize, idx.length);
     }
 };
 
@@ -77,26 +79,20 @@ std::vector<std::string> RecordReader::loadBatch(const std::vector<Index>& idxs)
 
 bool RecordReader::iter_step(uint64_t& off, uint64_t end, Record& out) {
     Impl& s = *p_;
-    std::string hdr(kHeaderSize, '\0');
     for (;;) {
-        if (off + kHeaderSize > end) return false;
-        if (pread_all(s.seg_fd, hdr.data(), kHeaderSize, off) != kHeaderSize) return false;
-        if (get_u32(hdr.data()) != kMagic) return false;            // framing gone -> end
-        uint32_t len = get_u32(hdr.data() + 4);
-        uint64_t reclen = kHeaderSize + len + kFooterSize;
-        if (off + reclen > end) return false;                       // runs past snapshot -> end
-        std::string body(len + kFooterSize, '\0');
+        FrameHeader h = read_header(s.seg_fd, off, end);
+        if (!h.ok) return false;                                    // framing break -> end
+        std::string body(h.len + kFooterSize, '\0');
         if (pread_all(s.seg_fd, body.data(), body.size(), off + kHeaderSize) != body.size())
-            return false;
-        if (get_u32(body.data() + len) != len) return false;        // len copies disagree -> end
-        uint32_t want = get_u32(hdr.data() + 8);
-        uint32_t crc = crc32c(hdr.data(), 8);              // header (magic+len)
-        crc = crc32c(body.data(), len, crc);               // payload
+            return false;                                           // short read -> end
+        BodyCheck c = check_body(h.raw, h.len, h.crc, body.data());
         uint64_t rec_off = off;
-        off += reclen;
-        if (crc != want) continue;                                  // interior bit-rot -> skip
-        out.index = Index{kSegmentId, len, rec_off};
-        out.value = body.substr(0, len);
+        off += h.reclen;
+        if (c == BodyCheck::BadFooter) return false;                // framing break -> end
+        if (c == BodyCheck::BadCrc) continue;                       // interior bit-rot -> skip
+        body.resize(h.len);                                         // drop the footer
+        out.index = Index{kSegmentId, h.len, rec_off};
+        out.value = std::move(body);
         return true;
     }
 }

@@ -97,18 +97,15 @@ struct RecordWriter::Impl {
         if (::fstat(fd, &st) != 0) return 0;
         uint64_t size = (uint64_t)st.st_size;
         uint64_t pos = 0;
-        std::string hdr(kHeaderSize, '\0');
-        while (pos + kHeaderSize <= size) {
-            if (pread_all(fd, hdr.data(), kHeaderSize, pos) != kHeaderSize) break;
-            if (get_u32(hdr.data()) != kMagic) break;            // framing gone -> tail tear
-            uint32_t len = get_u32(hdr.data() + 4);
-            uint64_t reclen = kHeaderSize + len + kFooterSize;
-            if (pos + reclen > size) break;                       // runs past EOF -> tail tear
-            std::string footer(kFooterSize, '\0');
-            if (pread_all(fd, footer.data(), kFooterSize, pos + kHeaderSize + len) != kFooterSize)
-                break;
-            if (get_u32(footer.data()) != len) break;             // len copies disagree -> tear
-            pos += reclen;  // framing sound (CRC, if bad, is caught at load())
+        for (;;) {
+            FrameHeader h = read_header(fd, pos, size);
+            if (!h.ok) break;                                     // framing break -> tail tear
+            // Framing-only recovery: verify just the footer (cheap) — the payload CRC
+            // is left for load(), so an interior CRC-bad record is preserved, not torn.
+            char footer[kFooterSize];
+            if (pread_all(fd, footer, kFooterSize, pos + kHeaderSize + h.len) != kFooterSize) break;
+            if (get_u32(footer) != h.len) break;                  // len copies disagree -> tear
+            pos += h.reclen;
         }
         if (pos < size) ::ftruncate(fd, (off_t)pos);  // drop only the unframed tail
         return pos;

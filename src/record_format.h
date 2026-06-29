@@ -71,16 +71,61 @@ inline std::string segment_path(const std::string& dir) {
     return dir + "/" + name;
 }
 
+// The record CRC: covers the first 8 header bytes (magic+len) then the payload.
+// One definition so the write and read paths can never disagree on what's covered.
+inline uint32_t crc_record(const char* hdr8, const void* payload, size_t len) {
+    uint32_t crc = crc32c(hdr8, 8);
+    return crc32c(payload, len, crc);
+}
+
 // Frame one record at dst: [magic|len|crc][payload|footer=len]. Returns total bytes.
 inline uint64_t frame_record(char* dst, const void* data, size_t len) {
     put_u32(dst + 0, kMagic);
     put_u32(dst + 4, (uint32_t)len);
-    uint32_t crc = crc32c(dst, 8);                    // cover magic + len
-    crc = crc32c(data, len, crc);                     // cover payload
-    put_u32(dst + 8, crc);
+    put_u32(dst + 8, crc_record(dst, data, len));
     if (len) std::memcpy(dst + kHeaderSize, data, len);
     put_u32(dst + kHeaderSize + len, (uint32_t)len);  // footer (torn-write delimiter)
     return kHeaderSize + len + kFooterSize;
+}
+
+// ---- record parsing (shared by recovery, scan, and load) -------------------
+
+// A parsed record header. `ok == false` means a framing break at this offset: a
+// short read, bad magic, or a record that would extend past `limit` (a torn tail
+// or EOF). When ok, `reclen` is the record's total on-disk size.
+struct FrameHeader {
+    bool     ok     = false;
+    uint32_t len    = 0;             // payload length
+    uint32_t crc    = 0;             // expected CRC (covers header[0..8) + payload)
+    uint64_t reclen = 0;             // kHeaderSize + len + kFooterSize
+    char     raw[kHeaderSize] = {};  // the raw header bytes (for the CRC)
+};
+
+// Read and framing-check the 12-byte header at `off`, never reading past `limit`.
+// This is the read+check step common to recovery, scan, and load.
+inline FrameHeader read_header(int fd, uint64_t off, uint64_t limit) {
+    FrameHeader h;
+    if (off + kHeaderSize > limit) return h;                          // runs past end
+    if (pread_all(fd, h.raw, kHeaderSize, off) != kHeaderSize) return h;  // short read
+    if (get_u32(h.raw) != kMagic) return h;                          // framing gone
+    h.len = get_u32(h.raw + 4);
+    h.reclen = kHeaderSize + (uint64_t)h.len + kFooterSize;
+    if (off + h.reclen > limit) return h;                            // record runs past end
+    h.crc = get_u32(h.raw + 8);
+    h.ok = true;
+    return h;
+}
+
+// Result of checking a record's body (`body` = len payload bytes followed by the
+// 4-byte footer) against its header.
+enum class BodyCheck { Ok, BadFooter, BadCrc };
+
+// Verify the footer (a second copy of len) and the CRC. Call only on a header that
+// read_header returned ok for.
+inline BodyCheck check_body(const char* hdr8, uint32_t len, uint32_t crc_want, const char* body) {
+    if (get_u32(body + len) != len) return BodyCheck::BadFooter;
+    if (crc_record(hdr8, body, len) != crc_want) return BodyCheck::BadCrc;
+    return BodyCheck::Ok;
 }
 
 }  // namespace fmt
