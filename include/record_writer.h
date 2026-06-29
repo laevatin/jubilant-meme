@@ -38,8 +38,10 @@ public:
     // Force all buffered writes durable (fsync). Safe to call anytime.
     void sync();
 
-    // Flush, stop the syncer, and close the segment fd. Idempotent; append()/sync()
-    // after close() throw. The destructor calls close().
+    // Flush, stop the syncer, and close the segment fd. Waits for any in-flight
+    // concurrent append()/sync() to finish before closing, and blocks new ones, so
+    // the fd is never closed out from under an active writer. Idempotent; after
+    // close() append() throws and sync() is a no-op. The destructor calls close().
     void close();
 
     Stats stats() const;

@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -21,6 +22,12 @@ struct RecordWriter::Impl {
     int dir_fd = -1;
 
     // The single segment file and its append point.
+    // io_mu guards the *lifetime* of seg_fd. Appends hold it shared for their whole
+    // body (reserve+pwrite+commit), so close()'s exclusive lock waits for every
+    // in-flight append to finish and blocks new ones before it closes the fd — no
+    // thread can pwrite/fsync a closed (or recycled) fd. append_mu separately guards
+    // the cursor + closed flag (a short critical section inside the shared lock).
+    std::shared_mutex io_mu;
     std::mutex append_mu;
     int seg_fd = -1;
     uint64_t cursor = 0;
@@ -192,6 +199,9 @@ struct RecordWriter::Impl {
         uint64_t p = 0;
         for (const auto& v : values) p += frame_record(buf.data() + p, v.data(), v.size());
 
+        // Hold io_mu shared across reserve+pwrite+commit so close() cannot pull the
+        // fd out from under us. reserve() still throws if the store was closed first.
+        std::shared_lock<std::shared_mutex> io_lock(io_mu);
         auto r = reserve(total);
         pwrite_all(seg_fd, buf.data(), total, r.off);
         commit(total);
@@ -236,12 +246,16 @@ std::vector<Index> RecordWriter::appendBatch(const std::vector<std::string>& val
 
 void RecordWriter::sync() {
     Impl& s = *p_;
+    std::shared_lock<std::shared_mutex> io_lock(s.io_mu);  // keep seg_fd alive vs close()
     if (s.seg_fd >= 0) { ::fsync(s.seg_fd); s.n_fsyncs.fetch_add(1); }
 }
 
 void RecordWriter::close() {
     if (!p_) return;
     Impl& s = *p_;
+    // Exclusive: blocks until every in-flight append has released its shared lock,
+    // and prevents new ones from starting, so we never close a fd someone is using.
+    std::unique_lock<std::shared_mutex> io_lock(s.io_mu);
     { std::lock_guard<std::mutex> lk(s.append_mu); if (s.closed) return; s.closed = true; }
     s.stop_syncer();
     if (s.seg_fd >= 0) { ::fsync(s.seg_fd); s.n_fsyncs.fetch_add(1); ::close(s.seg_fd); s.seg_fd = -1; }

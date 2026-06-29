@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <random>
 #include <string>
@@ -211,6 +212,50 @@ TEST(Concurrency, InterleavedAppendAndAppendBatch) {
     }
     auto r = RecordReader::open(opt);
     for (auto& [idx, v] : all) EXPECT_EQ(r->load(idx), v);
+}
+
+// close() racing with concurrent append()/sync(): close must wait for in-flight
+// appends and block new ones, so no thread ever pwrites/fsyncs a closed (or
+// recycled) fd. Best run under TSan, which flags the seg_fd data race if the
+// shared/exclusive locking regresses. Every append that *returned* must be durable.
+TEST(Concurrency, CloseRacesWithConcurrentAppendsAndSync) {
+    TmpDir d("closerace");
+    Options opt{.dir = d.path};
+    opt.durability = Durability::GroupCommit;
+    auto w = RecordWriter::open(opt);
+
+    std::mutex mu;
+    std::vector<std::pair<Index, std::string>> acked;
+    std::atomic<bool> go{false};
+
+    const int kThreads = 6;
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kThreads; ++t)
+        ts.emplace_back([&, t] {
+            while (!go.load()) {}  // line all threads up so the close lands mid-flight
+            std::vector<std::pair<Index, std::string>> mine;
+            for (int i = 0; i < 20000; ++i) {
+                auto v = make_value(t, i);
+                try {
+                    auto idx = w->append(v);  // throws once the writer is closed
+                    mine.emplace_back(idx, std::move(v));
+                    if ((i & 63) == 0) w->sync();  // also race sync() with close()
+                } catch (...) {
+                    break;  // closed: stop appending
+                }
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            for (auto& x : mine) acked.push_back(std::move(x));
+        });
+
+    go.store(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));  // let appends ramp up
+    w->close();  // races with the appenders above
+    for (auto& th : ts) th.join();
+
+    // Every append that the writer acknowledged must be present and exact.
+    auto r = RecordReader::open(opt);
+    for (auto& [idx, v] : acked) EXPECT_EQ(r->load(idx), v);
 }
 
 // Durability under concurrency: GroupCommit must make every acked concurrent

@@ -48,7 +48,10 @@ opaque handle.
 - **Writer and reader are separate objects** with their own file descriptors and no
   shared memory; the writer owns the append cursor, the reader is read-only.
 - **Append path:** frame the record(s), reserve a byte range under a tiny mutex,
-  `pwrite` outside the lock, then wait for the durability barrier.
+  `pwrite` outside the lock, then wait for the durability barrier. The whole append
+  holds a **shared** lifetime lock; `close()` takes it **exclusive**, so it waits for
+  in-flight appends and blocks new ones before closing the fd — a `pwrite`/`fsync`
+  never races a `close()` (which would otherwise hit a closed or recycled fd).
 - **Syncer thread:** for group-commit, coalesces queued writers and issues one
   `fsync` per batch, then wakes them; for async-flush, fsyncs on a size/time threshold.
 - **Read path:** route through `ReadCache` (currently a pass-through that always misses),
