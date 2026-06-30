@@ -30,26 +30,29 @@ void set_after_reserve_hook(void (*hook)()) { g_after_reserve_hook.store(hook); 
 }
 
 struct RecordWriter::Impl {
-    Options opts;
-    int dir_fd = -1;
+    Options opts;                 // immutable after open()
 
-    // The single segment file and its append point.
-    // io_mu guards the *lifetime* of seg_fd. Appends hold it shared for their whole
-    // body (reserve+pwrite+commit), so close()'s exclusive lock waits for every
-    // in-flight append to finish and blocks new ones before it closes the fd — no
-    // thread can pwrite/fsync a closed (or recycled) fd. append_mu separately guards
-    // the cursor + closed flag (a short critical section inside the shared lock).
+    // ---- seg_fd lifetime: io_mu -------------------------------------------
+    // io_mu guards the *lifetime* of the file descriptors, not their contents.
+    // Appends/sync hold it SHARED for their whole body (reserve+pwrite+commit), so
+    // close()'s EXCLUSIVE lock waits for every in-flight op to finish and blocks new
+    // ones before it closes the fd — nothing can pwrite/fsync a closed/recycled fd.
     std::shared_mutex io_mu;
-    std::mutex append_mu;
-    int seg_fd = -1;
-    uint64_t cursor = 0;
-    bool closed = false;
+    int seg_fd = -1;              // guarded by io_mu (read=shared on use, write=exclusive in close)
+    int dir_fd = -1;              // guarded by io_mu (closed under exclusive)
 
-    // Group-commit syncer.
+    // ---- append point: append_mu ------------------------------------------
+    // A short critical section taken *inside* the shared io_mu, just to hand out
+    // disjoint byte ranges and observe the closed flag.
+    std::mutex append_mu;
+    uint64_t cursor = 0;          // guarded by append_mu
+    bool closed = false;          // guarded by append_mu
+
+    // ---- group-commit queue: commit_mu / commit_cv ------------------------
     struct Waiter {
         std::mutex m;
         std::condition_variable cv;
-        bool done = false;
+        bool done = false;        // guarded by Waiter::m
         void wait() { std::unique_lock<std::mutex> l(m); cv.wait(l, [&] { return done; }); }
         // Notify *under* the lock: the Waiter is stack-allocated in commit(), so if
         // we signaled after releasing m, the woken thread could return and destroy
@@ -60,13 +63,13 @@ struct RecordWriter::Impl {
     };
     std::mutex commit_mu;
     std::condition_variable commit_cv;
-    std::vector<Waiter*> pending;             // GroupCommit: writers awaiting an fsync
-    std::atomic<uint64_t> unsynced_bytes{0};  // AsyncFlush: bytes written since the last fsync
-    std::thread syncer;
-    std::atomic<bool> running{false};
+    std::vector<Waiter*> pending;             // guarded by commit_mu (GroupCommit waiters)
 
-    // Stats.
-    std::atomic<uint64_t> n_appends{0}, n_bytes{0}, n_fsyncs{0};
+    // ---- lock-free (atomics / set-once) -----------------------------------
+    std::atomic<uint64_t> unsynced_bytes{0};  // atomic; AsyncFlush bytes since last fsync
+    std::thread syncer;                        // set at open(), joined at close()
+    std::atomic<bool> running{false};          // atomic; syncer run flag
+    std::atomic<uint64_t> n_appends{0}, n_bytes{0}, n_fsyncs{0};  // atomic stats
 
     void fsync_dir() { if (dir_fd >= 0) ::fsync(dir_fd); }
 
@@ -93,9 +96,7 @@ struct RecordWriter::Impl {
     // is framing-sound but CRC-bad is interior bit-rot: left in place (load rejects
     // it) and stepped over, so one corrupt record never discards later records.
     uint64_t recover_tail(int fd) {
-        struct stat st{};
-        if (::fstat(fd, &st) != 0) return 0;
-        uint64_t size = (uint64_t)st.st_size;
+        uint64_t size = file_size(fd);
         uint64_t pos = 0;
         for (;;) {
             FrameHeader h = read_header(fd, pos, size);
@@ -197,25 +198,36 @@ struct RecordWriter::Impl {
         }
     }
 
-    // Frame, reserve, write, and commit one or more contiguous records.
+    // Frame, reserve, write, and commit one or more records. Payloads are written
+    // straight from the caller's buffers via pwritev — only the small per-record
+    // framing bytes (header+footer) are staged, never the payload (no memcpy of the
+    // blob, which matters for large records and big batches).
     std::vector<Index> append_records(const std::vector<std::string>& values) {
         uint64_t total = 0;
         for (const auto& v : values) {
             if (v.size() > 0xFFFFFFFFull) throw std::invalid_argument("blob too large (>4GiB)");
             total += kHeaderSize + v.size() + kFooterSize;
         }
-        std::string buf(total, '\0');
-        uint64_t p = 0;
-        for (const auto& v : values) p += frame_record(buf.data() + p, v.data(), v.size());
+        // Stage only the framing bytes; reference each payload in place via iovec.
+        std::string frames(values.size() * (kHeaderSize + kFooterSize), '\0');
+        std::vector<struct iovec> iov;
+        iov.reserve(values.size() * 3);
+        for (size_t i = 0; i < values.size(); ++i) {
+            const std::string& v = values[i];
+            char* hdr = frames.data() + i * (kHeaderSize + kFooterSize);
+            char* footer = hdr + kHeaderSize;
+            frame_header(hdr, footer, v.data(), v.size());
+            iov.push_back({hdr, (size_t)kHeaderSize});
+            if (!v.empty()) iov.push_back({const_cast<char*>(v.data()), v.size()});  // read-only
+            iov.push_back({footer, (size_t)kFooterSize});
+        }
 
-        // Hold io_mu shared across reserve+pwrite+commit so close() cannot pull the
-        // fd out from under us. reserve() still throws if the store was closed first.
-        // Hold io_mu shared across reserve+pwrite+commit so close() cannot pull the
+        // Hold io_mu shared across reserve+pwritev+commit so close() cannot pull the
         // fd out from under us. reserve() still throws if the store was closed first.
         std::shared_lock<std::shared_mutex> io_lock(io_mu);
         auto r = reserve(total);
         if (auto h = g_after_reserve_hook.load(std::memory_order_relaxed)) h();  // test seam
-        pwrite_all(seg_fd, buf.data(), total, r.off);
+        pwritev_all(seg_fd, iov.data(), iov.size(), r.off);
         commit(total);
 
         std::vector<Index> out;

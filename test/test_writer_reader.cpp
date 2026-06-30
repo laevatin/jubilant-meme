@@ -216,6 +216,35 @@ TEST(WriterReader, ForwardScanOnEmptyStoreYieldsNothing) {
     EXPECT_EQ(got[1], std::string("bb"));
 }
 
+TEST(WriterReader, ScanIncrementPastEndIsNoOp) {
+    TmpDir d("iterpastend");
+    {
+        auto w = RecordWriter::open({.dir = d.path});
+        w->append("a");
+        w->append("bb");
+        w->close();
+    }
+    auto r = RecordReader::open({.dir = d.path});
+    auto scan = r->scan();
+    auto it = scan.begin();
+    size_t n = 0;
+    while (it != scan.end()) { ++it; ++n; }
+    EXPECT_EQ(n, (size_t)2);
+    EXPECT_TRUE(it == scan.end());
+    ++it;  // past-the-end increment must be a safe no-op
+    EXPECT_TRUE(it == scan.end());
+
+    // Empty store: begin() is already the end; ++ stays put.
+    TmpDir e("iterpastend_empty");
+    { auto w2 = RecordWriter::open({.dir = e.path}); w2->close(); }
+    auto r2 = RecordReader::open({.dir = e.path});
+    auto s2 = r2->scan();
+    auto e2 = s2.begin();
+    EXPECT_TRUE(e2 == s2.end());
+    ++e2;
+    EXPECT_TRUE(e2 == s2.end());
+}
+
 TEST(WriterReader, ForwardScanSkipsCrcCorruptRecord) {
     TmpDir d("iterskip");
     std::vector<Index> h;

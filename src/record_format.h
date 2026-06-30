@@ -9,6 +9,7 @@
 
 #include "crc32c.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -17,8 +18,14 @@
 #include <system_error>
 
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
+
+#ifndef IOV_MAX
+#define IOV_MAX 1024
+#endif
 
 namespace bs {
 namespace fmt {
@@ -65,6 +72,35 @@ inline size_t pread_all(int fd, char* buf, size_t n, uint64_t off) {
     return done;
 }
 
+// Vectored positioned write: writes every iov fully at `off`, handling partial
+// writes and the IOV_MAX limit. Lets the writer stream framing + payload to disk
+// without first copying payloads into one staging buffer. Mutates iov in place to
+// account for partial progress (caller owns the array).
+inline void pwritev_all(int fd, struct iovec* iov, size_t iovcnt, uint64_t off) {
+    size_t i = 0;
+    while (i < iovcnt) {
+        int batch = (int)std::min<size_t>(iovcnt - i, (size_t)IOV_MAX);
+        ssize_t w = ::pwritev(fd, iov + i, batch, (off_t)off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            throw std::system_error(errno, std::generic_category(), "pwritev");
+        }
+        off += (size_t)w;
+        size_t consumed = (size_t)w;
+        while (i < iovcnt && consumed >= iov[i].iov_len) { consumed -= iov[i].iov_len; ++i; }
+        if (consumed > 0 && i < iovcnt) {  // a partially-written iov: advance it
+            iov[i].iov_base = (char*)iov[i].iov_base + consumed;
+            iov[i].iov_len -= consumed;
+        }
+    }
+}
+
+// The segment's size in bytes (the recovery/scan boundary), or 0 on error.
+inline uint64_t file_size(int fd) {
+    struct stat st{};
+    return ::fstat(fd, &st) == 0 ? (uint64_t)st.st_size : 0;
+}
+
 inline std::string segment_path(const std::string& dir) {
     char name[32];
     std::snprintf(name, sizeof(name), "%06u.seg", kSegmentId);
@@ -78,14 +114,14 @@ inline uint32_t crc_record(const char* hdr8, const void* payload, size_t len) {
     return crc32c(payload, len, crc);
 }
 
-// Frame one record at dst: [magic|len|crc][payload|footer=len]. Returns total bytes.
-inline uint64_t frame_record(char* dst, const void* data, size_t len) {
-    put_u32(dst + 0, kMagic);
-    put_u32(dst + 4, (uint32_t)len);
-    put_u32(dst + 8, crc_record(dst, data, len));
-    if (len) std::memcpy(dst + kHeaderSize, data, len);
-    put_u32(dst + kHeaderSize + len, (uint32_t)len);  // footer (torn-write delimiter)
-    return kHeaderSize + len + kFooterSize;
+// Write a record's framing bytes only: the 12-byte header at `hdr` and the 4-byte
+// footer at `footer`. The payload is NOT copied — the caller streams it between them
+// (e.g. via pwritev), so a large blob is never memcpy'd into a staging buffer.
+inline void frame_header(char* hdr, char* footer, const void* payload, size_t len) {
+    put_u32(hdr + 0, kMagic);
+    put_u32(hdr + 4, (uint32_t)len);
+    put_u32(hdr + 8, crc_record(hdr, payload, len));
+    put_u32(footer, (uint32_t)len);  // footer (torn-write delimiter)
 }
 
 // ---- record parsing (shared by recovery, scan, and load) -------------------

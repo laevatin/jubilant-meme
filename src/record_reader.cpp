@@ -98,7 +98,9 @@ bool RecordReader::iter_step(uint64_t& off, uint64_t end, Record& out) {
 }
 
 void RecordReader::Iterator::advance() {
-    if (!owner_) { at_end_ = true; return; }
+    // Incrementing a past-the-end iterator is a no-op: it reads nothing and stays at
+    // the end (rather than issuing a doomed pread or running past the snapshot).
+    if (at_end_ || !owner_) { at_end_ = true; return; }
     at_end_ = !owner_->iter_step(off_, end_, cur_);
 }
 
@@ -106,8 +108,7 @@ RecordReader::Scan RecordReader::scan() {
     Iterator it;
     it.owner_ = this;
     it.off_ = 0;
-    struct stat st{};
-    it.end_ = (::fstat(p_->seg_fd, &st) == 0) ? (uint64_t)st.st_size : 0;
+    it.end_ = file_size(p_->seg_fd);  // snapshot the scan boundary at scan() time
     it.at_end_ = false;
     it.advance();  // position on the first record (or end, if empty)
     return Scan{it};
