@@ -10,6 +10,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -198,22 +199,23 @@ struct RecordWriter::Impl {
         }
     }
 
-    // Frame, reserve, write, and commit one or more records. Payloads are written
-    // straight from the caller's buffers via pwritev — only the small per-record
-    // framing bytes (header+footer) are staged, never the payload (no memcpy of the
-    // blob, which matters for large records and big batches).
-    std::vector<Index> append_records(const std::vector<std::string>& values) {
+    // Frame, reserve, write, and commit one or more records. Takes non-owning views
+    // so neither append() nor appendBatch() copies a payload: only the small per-
+    // record framing bytes are staged, and each payload is written straight from the
+    // caller's buffer via pwritev. Views must stay valid for the call (they do — the
+    // caller's strings outlive it).
+    std::vector<Index> append_views(const std::string_view* vs, size_t n) {
         uint64_t total = 0;
-        for (const auto& v : values) {
-            if (v.size() > 0xFFFFFFFFull) throw std::invalid_argument("blob too large (>4GiB)");
-            total += kHeaderSize + v.size() + kFooterSize;
+        for (size_t i = 0; i < n; ++i) {
+            if (vs[i].size() > 0xFFFFFFFFull) throw std::invalid_argument("blob too large (>4GiB)");
+            total += kHeaderSize + vs[i].size() + kFooterSize;
         }
         // Stage only the framing bytes; reference each payload in place via iovec.
-        std::string frames(values.size() * (kHeaderSize + kFooterSize), '\0');
+        std::string frames(n * (kHeaderSize + kFooterSize), '\0');
         std::vector<struct iovec> iov;
-        iov.reserve(values.size() * 3);
-        for (size_t i = 0; i < values.size(); ++i) {
-            const std::string& v = values[i];
+        iov.reserve(n * 3);
+        for (size_t i = 0; i < n; ++i) {
+            std::string_view v = vs[i];
             char* hdr = frames.data() + i * (kHeaderSize + kFooterSize);
             char* footer = hdr + kHeaderSize;
             frame_header(hdr, footer, v.data(), v.size());
@@ -231,14 +233,14 @@ struct RecordWriter::Impl {
         commit(total);
 
         std::vector<Index> out;
-        out.reserve(values.size());
+        out.reserve(n);
         uint64_t off = r.off, bytes = 0;
-        for (const auto& v : values) {
-            out.push_back(Index{kSegmentId, (uint32_t)v.size(), off});
-            off += kHeaderSize + v.size() + kFooterSize;
-            bytes += v.size();
+        for (size_t i = 0; i < n; ++i) {
+            out.push_back(Index{kSegmentId, (uint32_t)vs[i].size(), off});
+            off += kHeaderSize + vs[i].size() + kFooterSize;
+            bytes += vs[i].size();
         }
-        n_appends.fetch_add(values.size());
+        n_appends.fetch_add(n);
         n_bytes.fetch_add(bytes);
         return out;
     }
@@ -260,12 +262,15 @@ std::unique_ptr<RecordWriter> RecordWriter::open(const Options& opts) {
 }
 
 Index RecordWriter::append(const std::string& value) {
-    return p_->append_records({value}).front();
+    std::string_view sv(value);  // non-owning: no copy of the payload
+    return p_->append_views(&sv, 1).front();
 }
 
 std::vector<Index> RecordWriter::appendBatch(const std::vector<std::string>& values) {
     if (values.empty()) return {};
-    return p_->append_records(values);
+    // Cheap views over the caller's strings (pointer+size each), no payload copy.
+    std::vector<std::string_view> views(values.begin(), values.end());
+    return p_->append_views(views.data(), views.size());
 }
 
 void RecordWriter::sync() {
