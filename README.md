@@ -75,4 +75,5 @@ test/      test_*.cpp                                (GoogleTest: functional, re
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ctest --test-dir build --output-on-failure
 ./build/main /tmp/demo            # write 5 records then read them back
+./build/bench --mb 512            # throughput/latency matrix (4K/1M, seq/random, c=1/N)
 ```

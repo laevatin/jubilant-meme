@@ -20,6 +20,10 @@ target_link_libraries(recordstore PUBLIC Threads::Threads)
 add_executable(main app/main.cpp)
 target_link_libraries(main PRIVATE recordstore)
 
+# Benchmark.
+add_executable(bench bench/bench.cpp)
+target_link_libraries(bench PRIVATE recordstore)
+
 enable_testing()
 
 # GoogleTest: prefer a system install; fall back to fetching a pinned release.
